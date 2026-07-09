@@ -1,0 +1,25 @@
+# Swift and Xcode build output
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Local tooling and editor state
+.claude/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.jks
+*.keystore
+*.mobileprovision
+*.p12
+*.pfx
+*.pem
