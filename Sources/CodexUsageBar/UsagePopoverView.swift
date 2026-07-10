@@ -1,5 +1,6 @@
 import AppKit
 import CodexUsageCore
+import CodexUsageUI
 import SwiftUI
 
 struct UsagePopoverView: View {
@@ -8,6 +9,15 @@ struct UsagePopoverView: View {
     @ObservedObject var viewModel: UsageViewModel
     @AppStorage(UsagePreferences.selectedTimeframeKey) private var selectedTimeframeRaw = UsageTimeframe.thirty.rawValue
     @StateObject private var launchAtLogin = LaunchAtLoginController()
+    private let viewportSize: NSSize
+
+    init(
+        viewModel: UsageViewModel,
+        viewportSize: NSSize = Self.preferredSize
+    ) {
+        self.viewModel = viewModel
+        self.viewportSize = viewportSize
+    }
 
     var body: some View {
         // Scroll position is reset directly on the underlying NSScrollView by AppDelegate,
@@ -25,7 +35,7 @@ struct UsagePopoverView: View {
                     .padding(.vertical, 16)
             }
         }
-        .frame(width: Self.preferredSize.width, height: Self.preferredSize.height)
+        .frame(width: viewportSize.width, height: viewportSize.height)
         .onAppear {
             launchAtLogin.refresh()
         }
@@ -69,7 +79,7 @@ struct UsagePopoverView: View {
 
     private func snapshotContent(_ snapshot: UsageSnapshot) -> some View {
         let range = UsageRange(timeframe: selectedTimeframe, sourceBuckets: snapshot.sortedBuckets)
-        let chartBuckets = Array(range.chartBuckets.suffix(30))
+        let chartBuckets = range.chartBuckets
         let chartMaxTokens = chartBuckets.map(\.tokens).max() ?? 0
 
         return VStack(alignment: .leading, spacing: 0) {
@@ -92,11 +102,11 @@ struct UsagePopoverView: View {
 
             DividerLine()
 
-            rateLimitSection(snapshot)
+            dailySection(range.historyBuckets, title: selectedTimeframe.historyTitle)
 
             DividerLine()
 
-            dailySection(range.historyBuckets, title: selectedTimeframe.historyTitle)
+            rateLimitSection(snapshot)
 
             refreshFooter
 
@@ -160,8 +170,12 @@ struct UsagePopoverView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            UsageLineChart(buckets: buckets, maxTokens: maxTokens)
-                .frame(height: 92)
+            UsageLineChart(
+                buckets: buckets,
+                maxTokens: maxTokens,
+                timeframe: selectedTimeframe
+            )
+            .frame(height: 150)
         }
     }
 
@@ -347,10 +361,11 @@ private struct TimeframeTabs: View {
                         .foregroundStyle(selection == timeframe ? Color.primary : Color.secondary)
                         .background {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(selection == timeframe ? Color.white.opacity(0.13) : Color.clear)
+                                .fill(selection == timeframe ? Color.primary.opacity(0.10) : Color.clear)
                         }
                 }
                 .buttonStyle(.plain)
+                .accessibilityAddTraits(selection == timeframe ? .isSelected : [])
             }
         }
     }
@@ -404,76 +419,6 @@ private struct LimitInfoRows: View {
     }
 }
 
-private struct UsageLineChart: View {
-    let buckets: [DailyUsageBucket]
-    let maxTokens: Int64
-
-    private var hasActivity: Bool {
-        maxTokens > 0 && buckets.contains { $0.tokens > 0 }
-    }
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                ForEach(0..<4, id: \.self) { index in
-                    let y = proxy.size.height * CGFloat(index) / 3
-                    Path { path in
-                        path.move(to: CGPoint(x: 0, y: y))
-                        path.addLine(to: CGPoint(x: proxy.size.width, y: y))
-                    }
-                    .stroke(.white.opacity(0.10), lineWidth: 1)
-                }
-
-                Path { path in
-                    guard hasActivity else { return }
-                    if buckets.count == 1 {
-                        let y = yPosition(for: buckets[0].tokens, height: proxy.size.height)
-                        path.move(to: CGPoint(x: 0, y: y))
-                        path.addLine(to: CGPoint(x: proxy.size.width, y: y))
-                        return
-                    }
-
-                    let step = proxy.size.width / CGFloat(buckets.count - 1)
-                    for index in buckets.indices {
-                        let point = CGPoint(
-                            x: CGFloat(index) * step,
-                            y: yPosition(for: buckets[index].tokens, height: proxy.size.height)
-                        )
-                        if index == buckets.startIndex {
-                            path.move(to: point)
-                        } else {
-                            path.addLine(to: point)
-                        }
-                    }
-                }
-                .stroke(.mint, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-
-                if !hasActivity {
-                    Text("No activity")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 0) {
-                    ForEach(buckets) { bucket in
-                        Rectangle()
-                            .fill(Color.clear)
-                            .contentShape(Rectangle())
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .help("\(bucket.startDate): \(UsageFormatting.fullTokens(bucket.tokens)) tokens")
-                    }
-                }
-            }
-        }
-        .accessibilityLabel("Daily usage chart")
-    }
-
-    private func yPosition(for tokens: Int64, height: CGFloat) -> CGFloat {
-        let ratio = min(max(Double(tokens) / Double(max(maxTokens, 1)), 0), 1)
-        return height - (height * CGFloat(ratio))
-    }
-}
-
 private struct DailyUsageRow: View {
     let bucket: DailyUsageBucket
 
@@ -482,6 +427,8 @@ private struct DailyUsageRow: View {
             Text(bucket.startDate)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             Spacer()
             Image(systemName: "chart.line.uptrend.xyaxis")
                 .font(.system(size: 13, weight: .semibold))
@@ -548,7 +495,7 @@ private struct SectionTitle: View {
 private struct DividerLine: View {
     var body: some View {
         Rectangle()
-            .fill(.white.opacity(0.12))
+            .fill(Color.secondary.opacity(0.24))
             .frame(height: 1)
             .padding(.vertical, 13)
     }

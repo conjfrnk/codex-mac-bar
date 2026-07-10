@@ -16,8 +16,12 @@ final class UsageViewModel: ObservableObject {
     private let client: UsageFetching
     private var refreshTask: Task<Void, Never>?
 
-    init(client: UsageFetching) {
+    init(client: UsageFetching, initialSnapshot: UsageSnapshot? = nil) {
         self.client = client
+        snapshot = initialSnapshot
+        if initialSnapshot != nil {
+            state = .loaded
+        }
     }
 
     var statusTitle: String {

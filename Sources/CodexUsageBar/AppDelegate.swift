@@ -40,10 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func configureMenu() {
         menu.delegate = self
         menu.autoenablesItems = false
-        menu.appearance = NSAppearance(named: .darkAqua)
         menu.removeAllItems()
 
-        let hostingView = NSHostingView(rootView: UsagePopoverView(viewModel: viewModel).preferredColorScheme(.dark))
+        let hostingView = NSHostingView(rootView: UsagePopoverView(viewModel: viewModel))
         hostingView.frame = NSRect(origin: .zero, size: menuSize)
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor

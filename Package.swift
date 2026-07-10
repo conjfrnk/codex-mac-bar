@@ -9,18 +9,28 @@ let package = Package(
     ],
     products: [
         .library(name: "CodexUsageCore", targets: ["CodexUsageCore"]),
+        .library(name: "CodexUsageUI", targets: ["CodexUsageUI"]),
         .executable(name: "CodexUsageBar", targets: ["CodexUsageBar"]),
-        .executable(name: "CodexUsageChecks", targets: ["CodexUsageChecks"])
+        .executable(name: "CodexUsageChecks", targets: ["CodexUsageChecks"]),
+        .executable(name: "CodexUsageVisualChecks", targets: ["CodexUsageVisualChecks"])
     ],
     targets: [
         .target(name: "CodexUsageCore"),
+        .target(
+            name: "CodexUsageUI",
+            dependencies: ["CodexUsageCore"]
+        ),
         .executableTarget(
             name: "CodexUsageBar",
-            dependencies: ["CodexUsageCore"]
+            dependencies: ["CodexUsageCore", "CodexUsageUI"]
         ),
         .executableTarget(
             name: "CodexUsageChecks",
             dependencies: ["CodexUsageCore"]
+        ),
+        .executableTarget(
+            name: "CodexUsageVisualChecks",
+            dependencies: ["CodexUsageCore", "CodexUsageUI"]
         )
     ]
 )
