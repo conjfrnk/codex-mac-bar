@@ -324,8 +324,8 @@ func chartAxesAdaptTicksAndDateStylesToTimeframe() throws {
     try expect(UsageChartMath.tickIndices(pointCount: 30, maximumTickCount: 4) == [0, 10, 19, 29], "Month chart ticks should span the range")
     try expect(UsageChartMath.tickIndices(pointCount: 90, maximumTickCount: 3) == [0, 45, 89], "Quarter chart ticks should span the range")
     try expect(
-        UsageChartAxisPolicy.policy(for: .seven) == UsageChartAxisPolicy(maximumTickCount: 4, dateLabelStyle: .abbreviatedWeekday),
-        "Week chart should use compact weekday labels"
+        UsageChartAxisPolicy.policy(for: .seven) == UsageChartAxisPolicy(maximumTickCount: 7, dateLabelStyle: .singleLetterWeekday),
+        "Week chart should label every day with a single letter"
     )
     try expect(
         UsageChartAxisPolicy.policy(for: .thirty) == UsageChartAxisPolicy(maximumTickCount: 4, dateLabelStyle: .numericMonthDay),
@@ -520,6 +520,28 @@ func tokenFormattingIsCompact() throws {
     try expect(UsageFormatting.tokens(150_400_000_000) == "150B", "Expected B-format token count to drop decimals above 100")
 }
 
+func chartYAxisRoundsToNiceNumbers() throws {
+    try expect(UsageChartMath.niceAxisMaximum(0) == 0, "Zero peak should have a zero axis maximum")
+    try expect(UsageChartMath.niceAxisMaximum(999) == 1_000, "Axis maximum should round up to the next nice number")
+    try expect(UsageChartMath.niceAxisMaximum(1_500) == 2_000, "Axis maximum should round up within a decade")
+    try expect(UsageChartMath.niceAxisMaximum(100) == 100, "An already-nice value should stay unchanged")
+    try expect(
+        UsageChartMath.niceAxisMaximum(4_181_000_000) == 5_000_000_000,
+        "A B-range peak should round up to a nice multiple, not stay at its exact raw value"
+    )
+
+    try expect(UsageFormatting.axisTokens(0) == "0", "Zero should format as a plain axis label")
+    try expect(UsageFormatting.axisTokens(500_000) == "500K", "Whole-number axis label should have no decimal")
+    try expect(
+        UsageFormatting.axisTokens(5_000_000_000) == "5B",
+        "A nice round B-range axis label should not show trailing decimal zeros"
+    )
+    try expect(
+        UsageFormatting.axisTokens(2_500_000_000) == "2.5B",
+        "A nice half-step B-range axis label should show exactly one decimal"
+    )
+}
+
 let checks: [(String, () throws -> Void)] = [
     ("rollingThirtyDayTotalUsesCalendarWindow", rollingThirtyDayTotalUsesCalendarWindow),
     ("filledDailySeriesPreservesMissingDays", filledDailySeriesPreservesMissingDays),
@@ -536,6 +558,7 @@ let checks: [(String, () throws -> Void)] = [
     ("rejectsInvalidFlexibleIntegersAndAllowsMissingOptionals", rejectsInvalidFlexibleIntegersAndAllowsMissingOptionals),
     ("preferredCodexRateLimitUsesCodexBucket", preferredCodexRateLimitUsesCodexBucket),
     ("tokenFormattingIsCompact", tokenFormattingIsCompact),
+    ("chartYAxisRoundsToNiceNumbers", chartYAxisRoundsToNiceNumbers),
     ("rateLimitErrorIsBestEffort", rateLimitErrorIsBestEffort),
     ("malformedRateLimitIsBestEffort", malformedRateLimitIsBestEffort),
     ("missingRateLimitStillReturnsUsageAtTimeout", missingRateLimitStillReturnsUsageAtTimeout),

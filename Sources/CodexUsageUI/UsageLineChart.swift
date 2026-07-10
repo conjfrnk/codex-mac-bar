@@ -52,13 +52,25 @@ public struct UsageLineChart: View {
         return Calendar.current.dateComponents([.day], from: first, to: last).day.map(abs)
     }
 
+    /// The peak token count rounded up to a "nice" round number (see
+    /// `UsageChartMath.niceAxisMaximum`), used both for the Y-axis gridlines and to
+    /// scale the plotted line, so the axis reads as normal numbers (e.g. "5B") rather
+    /// than the raw peak's exact, oddly-precise value (e.g. "4.181B").
+    private var yAxisMax: Int64 {
+        UsageChartMath.niceAxisMaximum(maxTokens)
+    }
+
     private var yAxisValues: [Int64] {
-        guard maxTokens > 0 else { return [0] }
-        return [maxTokens, maxTokens / 2, 0].reduce(into: [Int64]()) { values, value in
+        guard yAxisMax > 0 else { return [0] }
+        return [yAxisMax, yAxisMax / 2, 0].reduce(into: [Int64]()) { values, value in
             if !values.contains(value) {
                 values.append(value)
             }
         }
+    }
+
+    private var tickLabelWidth: CGFloat {
+        axisPolicy.dateLabelStyle == .singleLetterWeekday ? 18 : 56
     }
 
     public init(
@@ -145,7 +157,7 @@ public struct UsageLineChart: View {
             }
             .stroke(Color.secondary.opacity(0.20), lineWidth: 1)
 
-            Text(UsageFormatting.tokens(value))
+            Text(UsageFormatting.axisTokens(value))
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -179,7 +191,7 @@ public struct UsageLineChart: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-                .frame(width: 56, alignment: xAxisAlignment(for: index))
+                .frame(width: tickLabelWidth, alignment: xAxisAlignment(for: index))
                 .position(
                     x: xAxisLabelCenter(for: index, x: x, in: layout),
                     y: layout.plotRect.maxY + 13
@@ -362,18 +374,20 @@ public struct UsageLineChart: View {
     }
 
     private func yPosition(for value: Double, in layout: ChartLayout) -> CGFloat {
-        let ratio = min(max(value / Double(max(maxTokens, 1)), 0), 1)
+        let ratio = min(max(value / Double(max(yAxisMax, 1)), 0), 1)
         return layout.plotRect.maxY - (layout.plotRect.height * CGFloat(ratio))
     }
 
     private func xAxisAlignment(for index: Int) -> Alignment {
+        guard buckets.count > 1 else { return .center }
         if index == buckets.startIndex { return .leading }
         if index == buckets.index(before: buckets.endIndex) { return .trailing }
         return .center
     }
 
     private func xAxisLabelCenter(for index: Int, x: CGFloat, in layout: ChartLayout) -> CGFloat {
-        let halfWidth: CGFloat = 28
+        guard buckets.count > 1 else { return x }
+        let halfWidth: CGFloat = tickLabelWidth / 2
         if index == buckets.startIndex {
             return layout.plotRect.minX + halfWidth
         }
@@ -389,6 +403,8 @@ public struct UsageLineChart: View {
         formatter.locale = .current
         formatter.timeZone = .current
         switch axisPolicy.dateLabelStyle {
+        case .singleLetterWeekday:
+            formatter.setLocalizedDateFormatFromTemplate("EEEEE")
         case .abbreviatedWeekday:
             formatter.setLocalizedDateFormatFromTemplate("EEE")
         case .numericMonthDay:

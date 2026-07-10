@@ -11,6 +11,7 @@ public struct UsageChartSample: Equatable, Sendable {
 }
 
 public enum UsageChartDateLabelStyle: Equatable, Sendable {
+    case singleLetterWeekday
     case abbreviatedWeekday
     case numericMonthDay
     case abbreviatedMonthDay
@@ -29,7 +30,7 @@ public struct UsageChartAxisPolicy: Equatable, Sendable {
     public static func policy(for timeframe: UsageTimeframe, spanDays: Int? = nil) -> Self {
         switch timeframe {
         case .seven:
-            return Self(maximumTickCount: 4, dateLabelStyle: .abbreviatedWeekday)
+            return Self(maximumTickCount: 7, dateLabelStyle: .singleLetterWeekday)
         case .thirty:
             return Self(maximumTickCount: 4, dateLabelStyle: .numericMonthDay)
         case .ninety:
@@ -213,6 +214,25 @@ public enum UsageChartMath {
         }
         let halfLength = itemLength / 2
         return min(max(proposed, lowerBound + halfLength), upperBound - halfLength)
+    }
+
+    /// Rounds a positive value up to a "nice" axis bound (1/2/5/10 times a power of
+    /// ten) so chart gridlines read as round numbers instead of the raw peak value.
+    public static func niceAxisMaximum(_ value: Int64) -> Int64 {
+        guard value > 0 else { return 0 }
+        let magnitude = pow(10, floor(log10(Double(value))))
+        guard magnitude.isFinite, magnitude > 0 else { return value }
+        let normalized = Double(value) / magnitude
+        let niceNormalized: Double
+        switch normalized {
+        case ...1: niceNormalized = 1
+        case ...2: niceNormalized = 2
+        case ...5: niceNormalized = 5
+        default: niceNormalized = 10
+        }
+        let result = (niceNormalized * magnitude).rounded()
+        guard result.isFinite, result <= Double(Int64.max) else { return value }
+        return Int64(result)
     }
 
     private static func sameDirection(_ lhs: Double, _ rhs: Double) -> Bool {

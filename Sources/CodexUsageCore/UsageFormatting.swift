@@ -19,6 +19,28 @@ public enum UsageFormatting {
         }
     }
 
+    /// Like `tokens(_:)`, but trims trailing zeros instead of forcing a fixed
+    /// number of decimal places — meant for chart axis gridlines, which are
+    /// rounded to "nice" values (see `UsageChartMath.niceAxisMaximum`) and so
+    /// never need more than one decimal digit to read as a clean, round number.
+    public static func axisTokens(_ value: Int64) -> String {
+        let absValue = abs(Double(value))
+        let sign = value < 0 ? "-" : ""
+
+        switch absValue {
+        case 0..<1_000:
+            return "\(value)"
+        case 1_000..<1_000_000:
+            return sign + compactTrimmed(absValue / 1_000, suffix: "K")
+        case 1_000_000..<1_000_000_000:
+            return sign + compactTrimmed(absValue / 1_000_000, suffix: "M")
+        case 1_000_000_000..<1_000_000_000_000:
+            return sign + compactTrimmed(absValue / 1_000_000_000, suffix: "B")
+        default:
+            return sign + compactTrimmed(absValue / 1_000_000_000_000, suffix: "T")
+        }
+    }
+
     public static func fullTokens(_ value: Int64) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -53,5 +75,14 @@ public enum UsageFormatting {
         let digits = value >= 100 ? 0 : maximumFractionDigits
         let format = digits == 0 ? "%.0f%@" : "%.\(digits)f%@"
         return String(format: format, value, suffix)
+    }
+
+    private static func compactTrimmed(_ value: Double, suffix: String) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 1
+        let number = formatter.string(from: NSNumber(value: value)) ?? String(format: "%.1f", value)
+        return number + suffix
     }
 }
