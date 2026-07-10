@@ -1,0 +1,10 @@
+// Merge this object into the top level of your Waybar config, then add
+// "custom/codex-usage" to modules-left, modules-center, or modules-right.
+"custom/codex-usage": {
+    "exec": "codex-usage-bar --waybar",
+    "return-type": "json",
+    "interval": 300,
+    "format": "{}",
+    "on-click": "codex-usage-bar --no-tray",
+    "tooltip": true
+}

@@ -1,5 +1,6 @@
 # Swift and Xcode build output
 .build/
+linux/target/
 .swiftpm/
 DerivedData/
 xcuserdata/

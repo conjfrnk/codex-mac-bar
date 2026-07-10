@@ -1,0 +1,42 @@
+# Maintainer: Codex Usage Bar contributors
+pkgname=codex-usage-bar
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Wayland-friendly status app for Codex usage and rate limits'
+arch=('x86_64' 'aarch64')
+url='https://github.com/conjfrnk/codex-mac-bar'
+license=('MIT')
+depends=('gtk4>=4.10' 'dbus')
+makedepends=('cargo')
+optdepends=('gnome-shell-extension-appindicator: tray icon support under GNOME Shell')
+source=("$pkgname-$pkgver.tar.gz")
+b2sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --frozen
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --all-targets --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/codex-usage-bar "$pkgdir/usr/bin/codex-usage-bar"
+  install -Dm644 data/io.github.conjfrnk.CodexUsageBar.desktop \
+    "$pkgdir/usr/share/applications/io.github.conjfrnk.CodexUsageBar.desktop"
+  install -Dm644 data/codex-usage-bar.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/codex-usage-bar.svg"
+  install -Dm644 data/waybar-module.jsonc \
+    "$pkgdir/usr/share/doc/$pkgname/waybar-module.jsonc"
+  install -Dm644 data/waybar-style.css \
+    "$pkgdir/usr/share/doc/$pkgname/waybar-style.css"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

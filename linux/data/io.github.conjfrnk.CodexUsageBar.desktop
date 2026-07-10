@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Codex Usage Bar
+GenericName=Codex Usage Monitor
+Comment=View account-wide Codex usage and rate limits
+Exec=codex-usage-bar --show
+TryExec=codex-usage-bar
+Icon=codex-usage-bar
+Terminal=false
+Categories=System;Monitor;
+Keywords=Codex;OpenAI;usage;tokens;rate limits;
+StartupNotify=false
+DBusActivatable=false

@@ -2,6 +2,8 @@
 
 A macOS menu bar app for viewing account-wide Codex token usage and rate limits through the locally installed Codex CLI.
 
+A separate Rust/GTK4 implementation for Wayland-oriented Linux desktops lives in [`linux/`](linux/README.md), with Arch packaging and source-based installation support.
+
 ## Requirements
 
 - macOS 13 or newer
