@@ -8,6 +8,8 @@ public struct UsageLineChart: View {
 
     @State private var hoveredIndex: Int?
     @State private var pinnedIndex: Int?
+    @State private var isHovering = false
+    @State private var suppressHoverUntilReentry = false
     @FocusState private var isFocused: Bool
 
     private var activeIndex: Int? {
@@ -255,12 +257,29 @@ public struct UsageLineChart: View {
             .fill(Color.clear)
             .contentShape(Rectangle())
             .frame(width: layout.plotRect.width, height: layout.plotRect.height)
-            .position(x: layout.plotRect.midX, y: layout.plotRect.midY)
+            // `.position` must stay the outermost modifier. Hover/gesture locations are
+            // reported in the local space of the view they're attached to; attaching them
+            // before `.position` ties that space unambiguously to this Rectangle's own
+            // frame (0...plotWidth). Attaching them after `.position` risked the location
+            // instead being reported relative to the full chart bounds (which include the
+            // left Y-axis label gutter), shifting every computed index rightward by roughly
+            // the gutter width — exactly the "selection lands right of the cursor" bug.
             .onContinuousHover { phase in
                 switch phase {
                 case let .active(location):
+                    // A fresh entry (the mouse just arrived, rather than merely continuing
+                    // to sit over the chart) always lets hover reclaim the display. Without
+                    // this, an arrow-key/accessibility selection could be silently overridden
+                    // by residual pointer jitter (e.g. a trackpad palm) that never actually
+                    // left the chart, contradicting the "persistent" keyboard selection.
+                    if !isHovering {
+                        isHovering = true
+                        suppressHoverUntilReentry = false
+                    }
+                    guard !suppressHoverUntilReentry else { return }
                     hoveredIndex = nearestIndex(at: location.x, plotWidth: layout.plotRect.width)
                 case .ended:
+                    isHovering = false
                     hoveredIndex = nil
                 }
             }
@@ -268,6 +287,7 @@ public struct UsageLineChart: View {
                 SpatialTapGesture()
                     .onEnded { value in
                         let index = nearestIndex(at: value.location.x, plotWidth: layout.plotRect.width)
+                        suppressHoverUntilReentry = false
                         pinnedIndex = index
                         hoveredIndex = index
                         isFocused = true
@@ -280,11 +300,7 @@ public struct UsageLineChart: View {
                 hoveredIndex = nil
                 pinnedIndex = nil
             }
-            .onChange(of: isFocused) { focused in
-                if focused && activeIndex == nil && !buckets.isEmpty {
-                    pinnedIndex = buckets.count - 1
-                }
-            }
+            .position(x: layout.plotRect.midX, y: layout.plotRect.midY)
     }
 
     @ViewBuilder
@@ -354,12 +370,15 @@ public struct UsageLineChart: View {
             return
         }
         hoveredIndex = nil
+        suppressHoverUntilReentry = true
         pinnedIndex = next
     }
 
     private func resetSelection() {
         hoveredIndex = nil
         pinnedIndex = nil
+        isHovering = false
+        suppressHoverUntilReentry = false
     }
 
     private func point(for index: Int, in layout: ChartLayout) -> CGPoint {
