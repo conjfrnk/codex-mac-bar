@@ -9,6 +9,7 @@ struct UsagePopoverView: View {
     @ObservedObject var viewModel: UsageViewModel
     @AppStorage(UsagePreferences.selectedTimeframeKey) private var selectedTimeframeRaw = UsageTimeframe.thirty.rawValue
     @StateObject private var launchAtLogin = LaunchAtLoginController()
+    @State private var dailyHistoryPage = 0
     private let viewportSize: NSSize
 
     init(
@@ -38,6 +39,9 @@ struct UsagePopoverView: View {
         .frame(width: viewportSize.width, height: viewportSize.height)
         .onAppear {
             launchAtLogin.refresh()
+        }
+        .onChange(of: selectedTimeframe) { _ in
+            dailyHistoryPage = 0
         }
     }
 
@@ -102,7 +106,11 @@ struct UsagePopoverView: View {
 
             DividerLine()
 
-            dailySection(range.historyBuckets, title: selectedTimeframe.historyTitle)
+            dailySection(
+                range.historyBuckets,
+                title: selectedTimeframe.historyTitle,
+                paginated: selectedTimeframe == .ninety || selectedTimeframe == .all
+            )
 
             DividerLine()
 
@@ -179,18 +187,44 @@ struct UsagePopoverView: View {
         }
     }
 
-    private func dailySection(_ buckets: [DailyUsageBucket], title: String) -> some View {
-        let rows = Array(buckets.reversed().prefix(6))
+    private func dailySection(_ buckets: [DailyUsageBucket], title: String, paginated: Bool) -> some View {
+        // `buckets` is chronologically ascending (oldest first); reverse once so index 0
+        // is always the newest row, matching the pager's page-0-is-newest convention.
+        let allRows = Array(buckets.reversed())
+        let pageSize = 6
+
+        // Week/Month pass paginated == false: pageCount collapses to 1 and start is always
+        // 0, so `rows` below is exactly `allRows.prefix(pageSize)` — unchanged from before,
+        // and the pager never mounts (see the `paginated && pageCount > 1` guard below).
+        let pageCount = paginated ? max(1, (allRows.count + pageSize - 1) / pageSize) : 1
+
+        // Render-time clamp: protects against `dailyHistoryPage` being stale relative to a
+        // shrunken/grown bucket count between refreshes, without mutating @State mid-body.
+        let page = min(max(dailyHistoryPage, 0), pageCount - 1)
+
+        let start = paginated ? page * pageSize : 0
+        let end = min(start + pageSize, allRows.count)
+        let rows = start < end ? Array(allRows[start..<end]) : []
 
         return VStack(alignment: .leading, spacing: 0) {
             SectionTitle(title)
                 .padding(.bottom, 5)
+
             if rows.isEmpty {
                 InfoRow(title: "History", value: "No daily buckets")
             } else {
                 ForEach(rows) { bucket in
                     DailyUsageRow(bucket: bucket)
                 }
+            }
+
+            if paginated && pageCount > 1 {
+                DailyHistoryPager(
+                    page: page,
+                    pageCount: pageCount,
+                    onPrevious: { dailyHistoryPage = max(0, page - 1) },
+                    onNext: { dailyHistoryPage = min(pageCount - 1, page + 1) }
+                )
             }
         }
     }
@@ -442,6 +476,63 @@ private struct DailyUsageRow: View {
         }
         .padding(.vertical, 4)
         .help("\(bucket.startDate): \(UsageFormatting.fullTokens(bucket.tokens)) tokens")
+    }
+}
+
+/// A minimal, quiet pager for the paginated daily-history section: "Page X of Y"
+/// flanked by small chevron buttons. Styled as a dimmer sibling of `MenuActionRow` —
+/// same plain-button + SF Symbol language, but secondary-toned, compact, and centered
+/// so it reads as a footnote under the row list rather than a new call to action.
+/// Direction convention: page 0 is the newest rows. The left/back chevron moves
+/// toward newer (decrements), the right/forward chevron moves toward older
+/// (increments); whichever side has nothing further in that direction is dimmed
+/// and disabled rather than wrapping or silently doing nothing.
+private struct DailyHistoryPager: View {
+    let page: Int
+    let pageCount: Int
+    let onPrevious: () -> Void
+    let onNext: () -> Void
+
+    private var isAtNewest: Bool { page <= 0 }
+    private var isAtOldest: Bool { page >= pageCount - 1 }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            pagerButton(systemImage: "chevron.left", isEnabled: !isAtNewest, label: "Newer", action: onPrevious)
+
+            Spacer(minLength: 0)
+
+            Text("Page \(page + 1) of \(pageCount)")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            Spacer(minLength: 0)
+
+            pagerButton(systemImage: "chevron.right", isEnabled: !isAtOldest, label: "Older", action: onNext)
+        }
+        .padding(.top, 6)
+    }
+
+    private func pagerButton(
+        systemImage: String,
+        isEnabled: Bool,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .opacity(isEnabled ? 1 : 0.32)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .accessibilityLabel(label)
     }
 }
 

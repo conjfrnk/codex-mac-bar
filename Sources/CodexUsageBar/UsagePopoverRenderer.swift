@@ -20,6 +20,13 @@ enum UsagePopoverRenderer {
         let width = try dimension("--width", defaultValue: 300, in: arguments)
         let height = try dimension("--height", defaultValue: 560, in: arguments)
         let size = NSSize(width: width, height: height)
+
+        if let timeframeRaw = option("--timeframe", in: arguments) {
+            guard let timeframe = UsageTimeframe(rawValue: timeframeRaw) else {
+                throw PopoverRenderFailure("--timeframe must be one of: seven, thirty, ninety, all")
+            }
+            UsagePreferences.selectedTimeframe = timeframe
+        }
         let outputURL = URL(fileURLWithPath: arguments[pathIndex])
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(),

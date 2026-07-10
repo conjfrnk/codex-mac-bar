@@ -24,11 +24,11 @@ public enum UsageTimeframe: String, CaseIterable, Identifiable, Sendable {
     public var heroTitle: String {
         switch self {
         case .seven:
-            return "Last 7 days"
+            return "Last 7 days (rolling)"
         case .thirty:
-            return "Last 30 days"
+            return "Last 30 days (rolling)"
         case .ninety:
-            return "Last 90 days"
+            return "Last 90 days (rolling)"
         case .all:
             return "All time"
         }
