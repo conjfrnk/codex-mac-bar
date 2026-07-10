@@ -1,0 +1,27 @@
+[package]
+name = "codex-usage-bar-linux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Wayland-friendly Linux status app for Codex usage and rate limits"
+license = "MIT"
+repository = "https://github.com/conjfrnk/codex-mac-bar"
+
+[[bin]]
+name = "codex-usage-bar"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["clock"] }
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"] }
+ksni = { version = "0.3.5", features = ["blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+strip = true

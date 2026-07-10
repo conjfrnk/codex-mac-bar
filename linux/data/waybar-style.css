@@ -1,0 +1,8 @@
+/* Optional Waybar styling for the custom/codex-usage module. */
+#custom-codex-usage {
+  padding: 0 8px;
+}
+
+#custom-codex-usage.error {
+  color: #ff5f57;
+}
