@@ -35,6 +35,10 @@ func expectThrows<T>(_ message: String, _ body: () throws -> T) throws {
     throw CheckFailure.failed(message)
 }
 
+func expectApproximatelyEqual(_ lhs: Double, _ rhs: Double, _ message: String) throws {
+    try expect(abs(lhs - rhs) <= 0.000_001, message)
+}
+
 private final class SnapshotResultBox: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<UsageSnapshot, Error>?
@@ -198,6 +202,171 @@ func chartRangePreservesZeroUsageCalendarGaps() throws {
     try expect(emptyRange.chartBuckets.allSatisfy { $0.tokens == 0 }, "Empty chart should contain only zero values")
 }
 
+func smoothedChartPreservesAnchorsAndBoundsEverySegment() throws {
+    let values: [Int64] = [0, 80, 20, 120, 120, 10]
+    let samplesPerSegment = 16
+    let samples = UsageChartMath.smoothedSamples(
+        values: values,
+        samplesPerSegment: samplesPerSegment
+    )
+
+    try expect(
+        samples.count == (values.count - 1) * samplesPerSegment + 1,
+        "Smoothed chart should emit the expected number of samples"
+    )
+    for index in values.indices {
+        try expectApproximatelyEqual(
+            samples[index * samplesPerSegment].value,
+            Double(values[index]),
+            "Smoothed chart should pass through source anchor \(index)"
+        )
+    }
+
+    for (index, sample) in samples.dropLast().enumerated() {
+        let segment = index / samplesPerSegment
+        let lower = Double(min(values[segment], values[segment + 1]))
+        let upper = Double(max(values[segment], values[segment + 1]))
+        try expect(sample.value >= lower, "Smoothed chart should not undershoot segment \(segment)")
+        try expect(sample.value <= upper, "Smoothed chart should not overshoot segment \(segment)")
+        try expect(sample.value >= 0, "Nonnegative chart data should remain nonnegative")
+    }
+
+    for segment in 0..<(values.count - 1) {
+        let segmentSamples = samples[(segment * samplesPerSegment)...((segment + 1) * samplesPerSegment)]
+        for (before, after) in zip(segmentSamples, segmentSamples.dropFirst()) {
+            if values[segment] <= values[segment + 1] {
+                try expect(after.value >= before.value, "Increasing segment \(segment) should remain monotone")
+            } else {
+                try expect(after.value <= before.value, "Decreasing segment \(segment) should remain monotone")
+            }
+        }
+    }
+}
+
+func smallChartSeriesRemainUnsmoothed() throws {
+    try expect(UsageChartMath.smoothedSamples(values: []).isEmpty, "Empty chart should have no samples")
+    try expect(
+        UsageChartMath.smoothedSamples(values: [42]) == [UsageChartSample(position: 0.5, value: 42)],
+        "One-point chart should remain a single centered point"
+    )
+    try expect(
+        UsageChartMath.smoothedSamples(values: [10, 30]) == [
+            UsageChartSample(position: 0, value: 10),
+            UsageChartSample(position: 1, value: 30)
+        ],
+        "Two-point chart should remain a straight segment"
+    )
+}
+
+func smoothedChartSupportsNonuniformDates() throws {
+    let values: [Int64] = [0, 100, 10]
+    let positions = [0.0, 0.1, 1.0]
+    let samplesPerSegment = 10
+    let samples = UsageChartMath.smoothedSamples(
+        values: values,
+        positions: positions,
+        samplesPerSegment: samplesPerSegment
+    )
+
+    try expectApproximatelyEqual(samples[0].position, 0, "First chart point should keep its date position")
+    try expectApproximatelyEqual(samples[samplesPerSegment].position, 0.1, "Middle chart point should keep its date position")
+    try expectApproximatelyEqual(samples[samplesPerSegment * 2].position, 1, "Last chart point should keep its date position")
+    try expectApproximatelyEqual(samples[samplesPerSegment].value, 100, "Nonuniform smoothing should retain its middle anchor")
+    try expect(samples[0..<samplesPerSegment].allSatisfy { $0.value >= 0 && $0.value <= 100 }, "First nonuniform segment should stay bounded")
+    try expect(samples[samplesPerSegment...].allSatisfy { $0.value >= 10 && $0.value <= 100 }, "Second nonuniform segment should stay bounded")
+    try expect(
+        UsageChartMath.nearestIndex(to: 0.4, positions: [0, 0.2, 1]) == 1,
+        "Hover selection should use actual nonuniform date positions"
+    )
+    try expect(
+        UsageChartMath.tickIndices(positions: [0, 0.05, 0.4, 0.95, 1], maximumTickCount: 3) == [0, 2, 4],
+        "Axis ticks should span nonuniform date positions"
+    )
+}
+
+func chartMathRejectsNumericallyUnstablePositions() throws {
+    let extreme = UsageChartMath.smoothedSamples(
+        values: [0, 1, 2],
+        positions: [-Double.greatestFiniteMagnitude, 0, Double.greatestFiniteMagnitude],
+        samplesPerSegment: 4
+    )
+    try expect(extreme.allSatisfy { $0.position.isFinite && $0.value.isFinite }, "Extreme positions should fall back to finite samples")
+    try expect(extreme.first?.position == 0 && extreme.last?.position == 1, "Extreme positions should fall back to normalized endpoints")
+
+    let tinyInterval = UsageChartMath.smoothedSamples(
+        values: [0, 1, 2],
+        positions: [0, Double.leastNonzeroMagnitude, 1],
+        samplesPerSegment: 4
+    )
+    try expect(tinyInterval.allSatisfy { $0.position.isFinite && $0.value.isFinite }, "Tiny intervals should fall back to finite samples")
+    try expect(
+        UsageChartMath.tickIndices(
+            positions: [-Double.greatestFiniteMagnitude, 0, Double.greatestFiniteMagnitude],
+            maximumTickCount: 2
+        ) == [0, 2],
+        "Unstable tick positions should retain range endpoints"
+    )
+    try expect(
+        UsageChartMath.clampedCenter(
+            proposed: 0,
+            itemLength: 1,
+            lowerBound: .nan,
+            upperBound: 10
+        ).isFinite,
+        "Invalid clamping bounds should still return a finite fallback"
+    )
+}
+
+func chartAxesAdaptTicksAndDateStylesToTimeframe() throws {
+    try expect(UsageChartMath.tickIndices(pointCount: 0, maximumTickCount: 4) == [], "Empty chart should have no ticks")
+    try expect(UsageChartMath.tickIndices(pointCount: 1, maximumTickCount: 4) == [0], "Single-point chart should have one tick")
+    try expect(UsageChartMath.tickIndices(pointCount: 7, maximumTickCount: 4) == [0, 2, 4, 6], "Week chart ticks should include endpoints")
+    try expect(UsageChartMath.tickIndices(pointCount: 30, maximumTickCount: 4) == [0, 10, 19, 29], "Month chart ticks should span the range")
+    try expect(UsageChartMath.tickIndices(pointCount: 90, maximumTickCount: 3) == [0, 45, 89], "Quarter chart ticks should span the range")
+    try expect(
+        UsageChartAxisPolicy.policy(for: .seven) == UsageChartAxisPolicy(maximumTickCount: 4, dateLabelStyle: .abbreviatedWeekday),
+        "Week chart should use compact weekday labels"
+    )
+    try expect(
+        UsageChartAxisPolicy.policy(for: .thirty) == UsageChartAxisPolicy(maximumTickCount: 4, dateLabelStyle: .numericMonthDay),
+        "Month chart should use numeric date labels"
+    )
+    try expect(
+        UsageChartAxisPolicy.policy(for: .ninety) == UsageChartAxisPolicy(maximumTickCount: 3, dateLabelStyle: .abbreviatedMonthDay),
+        "Quarter chart should use fewer abbreviated date labels"
+    )
+    try expect(
+        UsageChartAxisPolicy.policy(for: .all, spanDays: 500) == UsageChartAxisPolicy(maximumTickCount: 3, dateLabelStyle: .abbreviatedMonthYear),
+        "Long all-time charts should use month and year labels"
+    )
+}
+
+func chartSelectionSnapsAndTooltipStaysInBounds() throws {
+    try expect(UsageChartMath.nearestIndex(to: 0.5, pointCount: 0) == nil, "Empty chart should not select a point")
+    try expect(UsageChartMath.nearestIndex(to: .nan, pointCount: 5) == nil, "Invalid chart position should not select a point")
+    try expect(UsageChartMath.nearestIndex(to: -1, pointCount: 5) == 0, "Selection should clamp before the plot")
+    try expect(UsageChartMath.nearestIndex(to: 0.26, pointCount: 5) == 1, "Selection should snap to the nearest point")
+    try expect(UsageChartMath.nearestIndex(to: 0.5, pointCount: 5) == 2, "Selection should snap at the midpoint")
+    try expect(UsageChartMath.nearestIndex(to: 2, pointCount: 5) == 4, "Selection should clamp after the plot")
+
+    try expect(
+        UsageChartMath.clampedCenter(proposed: 0, itemLength: 120, lowerBound: 40, upperBound: 264) == 100,
+        "Leading tooltip should stay inside the plot"
+    )
+    try expect(
+        UsageChartMath.clampedCenter(proposed: 264, itemLength: 120, lowerBound: 40, upperBound: 264) == 204,
+        "Trailing tooltip should stay inside the plot"
+    )
+    try expect(
+        UsageChartMath.clampedCenter(proposed: 150, itemLength: 120, lowerBound: 40, upperBound: 264) == 150,
+        "Centered tooltip should keep its proposed position"
+    )
+    try expect(
+        UsageChartMath.clampedCenter(proposed: 100, itemLength: 400, lowerBound: 40, upperBound: 264) == 152,
+        "Oversized tooltip should center in the available plot"
+    )
+}
+
 func decodesUsageResponseWithNumericAndStringIntegers() throws {
     let json = """
     {
@@ -280,7 +449,7 @@ func malformedRateLimitIsBestEffort() throws {
 func missingRateLimitStillReturnsUsageAtTimeout() throws {
     let snapshot = try runFakeCodex(
         script: fakeCodexScript(rateLimitAction: ""),
-        timeout: 0.25
+        timeout: 2
     ).get()
     try expect(snapshot.sortedBuckets.map(\.tokens) == [7], "Expected usage when rate-limit response is missing")
     try expect(snapshot.rateLimits == nil, "Missing rate-limit response should produce no rate-limit snapshot")
@@ -357,6 +526,12 @@ let checks: [(String, () throws -> Void)] = [
     ("filledDailySeriesMergesDuplicateDates", filledDailySeriesMergesDuplicateDates),
     ("allTimeRangeMergesAndSortsDuplicateDates", allTimeRangeMergesAndSortsDuplicateDates),
     ("chartRangePreservesZeroUsageCalendarGaps", chartRangePreservesZeroUsageCalendarGaps),
+    ("smoothedChartPreservesAnchorsAndBoundsEverySegment", smoothedChartPreservesAnchorsAndBoundsEverySegment),
+    ("smallChartSeriesRemainUnsmoothed", smallChartSeriesRemainUnsmoothed),
+    ("smoothedChartSupportsNonuniformDates", smoothedChartSupportsNonuniformDates),
+    ("chartMathRejectsNumericallyUnstablePositions", chartMathRejectsNumericallyUnstablePositions),
+    ("chartAxesAdaptTicksAndDateStylesToTimeframe", chartAxesAdaptTicksAndDateStylesToTimeframe),
+    ("chartSelectionSnapsAndTooltipStaysInBounds", chartSelectionSnapsAndTooltipStaysInBounds),
     ("decodesUsageResponseWithNumericAndStringIntegers", decodesUsageResponseWithNumericAndStringIntegers),
     ("rejectsInvalidFlexibleIntegersAndAllowsMissingOptionals", rejectsInvalidFlexibleIntegersAndAllowsMissingOptionals),
     ("preferredCodexRateLimitUsesCodexBucket", preferredCodexRateLimitUsesCodexBucket),
