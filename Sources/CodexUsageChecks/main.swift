@@ -59,7 +59,7 @@ private final class SnapshotResultBox: @unchecked Sendable {
 func fetchResult(_ client: CodexAppServerClient) throws -> Result<UsageSnapshot, Error> {
     let semaphore = DispatchSemaphore(value: 0)
     let box = SnapshotResultBox()
-    Task.detached {
+    let task = Task.detached {
         do {
             box.store(.success(try await client.fetchUsageSnapshot()))
         } catch {
@@ -69,6 +69,8 @@ func fetchResult(_ client: CodexAppServerClient) throws -> Result<UsageSnapshot,
     }
 
     guard semaphore.wait(timeout: .now() + .seconds(8)) == .success else {
+        task.cancel()
+        _ = semaphore.wait(timeout: .now() + .seconds(2))
         throw CheckFailure.failed("Fake Codex app-server check timed out")
     }
     return try require(box.take(), "Fake Codex app-server check did not return a result")
@@ -83,6 +85,9 @@ func runFakeCodex(script: String, timeout: TimeInterval = 2) throws -> Result<Us
     let previousValue = getenv(environmentKey).map { String(cString: $0) }
 
     try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? fileManager.removeItem(at: directory)
+    }
     try Data(script.utf8).write(to: executable)
     try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
     guard setenv(environmentKey, executable.path, 1) == 0 else {
@@ -95,7 +100,6 @@ func runFakeCodex(script: String, timeout: TimeInterval = 2) throws -> Result<Us
         } else {
             unsetenv(environmentKey)
         }
-        try? fileManager.removeItem(at: directory)
     }
 
     return try fetchResult(CodexAppServerClient(timeout: timeout))
@@ -565,32 +569,40 @@ let checks: [(String, () throws -> Void)] = [
     ("oversizedAppServerMessageIsRejected", oversizedAppServerMessageIsRejected)
 ]
 
+let checkArguments = Array(CommandLine.arguments.dropFirst())
+if !checkArguments.isEmpty, checkArguments != ["--live"] {
+    fputs("usage: CodexUsageChecks [--live]\n", stderr)
+    exit(64)
+}
+let shouldRunLiveCheck = checkArguments == ["--live"]
+
 do {
     for (name, check) in checks {
         try check()
         print("PASS \(name)")
     }
 
-    if CommandLine.arguments.contains("--live") {
+    if shouldRunLiveCheck {
         let semaphore = DispatchSemaphore(value: 0)
-        var liveResult: Result<UsageSnapshot, Error>?
-        Task.detached {
+        let box = SnapshotResultBox()
+        let liveTask = Task.detached {
             do {
-                liveResult = .success(try await CodexAppServerClient(timeout: 20).fetchUsageSnapshot())
+                box.store(.success(try await CodexAppServerClient(timeout: 20).fetchUsageSnapshot()))
             } catch {
-                liveResult = .failure(error)
+                box.store(.failure(error))
             }
             semaphore.signal()
         }
-        semaphore.wait()
+        guard semaphore.wait(timeout: .now() + .seconds(25)) == .success else {
+            liveTask.cancel()
+            _ = semaphore.wait(timeout: .now() + .seconds(2))
+            throw CheckFailure.failed("Live usage check exceeded its outer watchdog")
+        }
 
-        let snapshot = try liveResult?.get() ?? {
+        _ = try box.take()?.get() ?? {
             throw CheckFailure.failed("Live usage check did not complete")
         }()
-        let buckets = snapshot.usage.dailyUsageBuckets ?? []
-        let rollingTotal = snapshot.rollingTokenTotal()
-        let primaryPercent = snapshot.rateLimits?.preferredCodexLimit?.primary?.usedPercent
-        print("PASS liveAccountUsage buckets=\(buckets.count) rolling30=\(UsageFormatting.fullTokens(rollingTotal)) primary=\(primaryPercent.map { UsageFormatting.percent($0) } ?? "n/a")")
+        print("PASS liveAccountUsage response shape decoded")
     }
 } catch {
     fputs("FAIL \(error)\n", stderr)

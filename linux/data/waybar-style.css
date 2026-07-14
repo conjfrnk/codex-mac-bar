@@ -4,5 +4,7 @@
 }
 
 #custom-codex-usage.error {
-  color: #ff5f57;
+  /* Keep the panel theme's own high-contrast foreground instead of forcing a
+     red that can disappear on light Waybar themes. */
+  font-weight: 700;
 }

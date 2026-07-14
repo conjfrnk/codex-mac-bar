@@ -5,6 +5,8 @@ linux/target/
 DerivedData/
 xcuserdata/
 *.xcuserstate
+*.profraw
+*.profdata
 
 # Local tooling and editor state
 .claude/

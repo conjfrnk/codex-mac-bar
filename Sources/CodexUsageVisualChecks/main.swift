@@ -1,6 +1,7 @@
 import AppKit
 import CodexUsageCore
 import CodexUsageUI
+import Darwin
 import SwiftUI
 
 private struct RenderCase {
@@ -9,19 +10,22 @@ private struct RenderCase {
     let buckets: [DailyUsageBucket]
     let colorScheme: ColorScheme
     let selectedIndex: Int?
+    let positions: [Double]?
 
     init(
         name: String,
         timeframe: UsageTimeframe,
         buckets: [DailyUsageBucket],
         colorScheme: ColorScheme,
-        selectedIndex: Int? = nil
+        selectedIndex: Int? = nil,
+        positions: [Double]? = nil
     ) {
         self.name = name
         self.timeframe = timeframe
         self.buckets = buckets
         self.colorScheme = colorScheme
         self.selectedIndex = selectedIndex
+        self.positions = positions
     }
 }
 
@@ -29,10 +33,27 @@ private struct RenderCase {
 @MainActor
 enum CodexUsageVisualChecks {
     private static let outputSize = NSSize(width: 300, height: 186)
+    private static let fixtureLocale = Locale(identifier: "en_US_POSIX")
 
-    static func main() throws {
-        _ = NSApplication.shared
+    private static var fixtureCalendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = fixtureLocale
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar
+    }
+
+    static func main() {
+        do {
+            try run()
+        } catch {
+            fputs("FAIL \(error)\n", stderr)
+            exit((error as? VisualCheckFailure)?.exitCode ?? 1)
+        }
+    }
+
+    private static func run() throws {
         let outputDirectory = try resolvedOutputDirectory()
+        _ = NSApplication.shared
         try FileManager.default.createDirectory(
             at: outputDirectory,
             withIntermediateDirectories: true
@@ -54,6 +75,28 @@ enum CodexUsageVisualChecks {
             throw VisualCheckFailure("Light and dark chart renders should differ")
         }
         print("PASS lightAndDarkRendersDiffer")
+
+        guard renderedData["tooltip-leading-light"] != renderedData["month-light"],
+              renderedData["tooltip-trailing-dark"] != renderedData["month-dark"]
+        else {
+            throw VisualCheckFailure("Pinned selections should visibly render their marker and tooltip")
+        }
+        print("PASS pinnedSelectionsRender")
+
+        try validatePinnedTooltipRegion(
+            selected: renderedData["tooltip-leading-light"],
+            base: renderedData["month-light"],
+            name: "tooltip-leading-light"
+        )
+        try validatePinnedTooltipRegion(
+            selected: renderedData["tooltip-trailing-dark"],
+            base: renderedData["month-dark"],
+            name: "tooltip-trailing-dark"
+        )
+        try validateEmptyOrZeroState(renderedData["zero-light"], name: "zero-light")
+        try validateEmptyOrZeroState(renderedData["empty-light"], name: "empty-light")
+        try validateSparseBaseline(renderedData["all-sparse-dark"])
+        print("PASS stateSpecificPixelLandmarks")
     }
 
     private static func render(_ renderCase: RenderCase) throws -> Data {
@@ -68,7 +111,10 @@ enum CodexUsageVisualChecks {
                 buckets: renderCase.buckets,
                 maxTokens: maxTokens,
                 timeframe: renderCase.timeframe,
-                selectedIndex: renderCase.selectedIndex
+                selectedIndex: renderCase.selectedIndex,
+                positions: renderCase.positions,
+                calendar: fixtureCalendar,
+                locale: fixtureLocale
             )
             .frame(width: 264, height: 150)
             .padding(18)
@@ -176,6 +222,123 @@ enum CodexUsageVisualChecks {
             throw VisualCheckFailure("\(renderCase.name) did not render the Tokens axis title")
         }
 
+        if renderCase.buckets.contains(where: { $0.tokens > 0 }) {
+            var accentPixels = 0
+            var strongestContrast: CGFloat = 0
+            // The chart is padded by 18 points and its plot occupies the region
+            // below the title and above the date labels. Text/grid pixels are
+            // effectively achromatic, so a chromatic scan detects the actual
+            // usage stroke/marker rather than merely proving that some ink exists.
+            for x in stride(from: CGFloat(58), through: 280, by: 1) {
+                for y in stride(from: CGFloat(34), through: 143, by: 1) {
+                    guard let actual = color(at: CGPoint(x: x, y: y)) else { continue }
+                    let components = [actual.redComponent, actual.greenComponent, actual.blueComponent]
+                    guard let minimum = components.min(), let maximum = components.max(),
+                          maximum - minimum > 0.10,
+                          colorDistance(actual, background) > 0.16
+                    else { continue }
+                    accentPixels += 1
+                    strongestContrast = max(strongestContrast, contrastRatio(actual, background))
+                }
+            }
+            guard accentPixels >= 18 else {
+                throw VisualCheckFailure("\(renderCase.name) did not render a detectable usage line or marker")
+            }
+            guard strongestContrast >= 3 else {
+                throw VisualCheckFailure(
+                    "\(renderCase.name) chart accent contrast was only \(String(format: "%.2f", strongestContrast)):1"
+                )
+            }
+        }
+    }
+
+    private static func validatePinnedTooltipRegion(
+        selected: Data?,
+        base: Data?,
+        name: String
+    ) throws {
+        guard let selected,
+              let base,
+              let selectedImage = NSBitmapImageRep(data: selected),
+              let baseImage = NSBitmapImageRep(data: base),
+              selectedImage.pixelsWide == baseImage.pixelsWide,
+              selectedImage.pixelsHigh == baseImage.pixelsHigh
+        else { throw VisualCheckFailure("Could not compare tooltip pixels for \(name)") }
+
+        let region = CGRect(x: 55, y: 45, width: 225, height: 100)
+        let changed = pointNormalizedPixelCount(in: selectedImage, region: region) { x, y in
+            guard let lhs = selectedImage.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                  let rhs = baseImage.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+            else { return false }
+            return colorDistance(lhs, rhs) > 0.08
+        }
+        guard changed >= 1_000 else {
+            throw VisualCheckFailure(
+                "\(name) changed only \(Int(changed)) tooltip-region pixels; marker-only output is insufficient"
+            )
+        }
+    }
+
+    private static func validateEmptyOrZeroState(_ data: Data?, name: String) throws {
+        guard let data, let image = NSBitmapImageRep(data: data),
+              let background = image.colorAt(x: 4, y: 4)?.usingColorSpace(.deviceRGB)
+        else { throw VisualCheckFailure("Could not inspect the \(name) render") }
+        let messageRegion = CGRect(x: 90, y: 60, width: 140, height: 65)
+        let ink = pointNormalizedPixelCount(in: image, region: messageRegion) { x, y in
+            guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                return false
+            }
+            return colorDistance(color, background) > 0.25
+        }
+        guard ink >= 100 else {
+            throw VisualCheckFailure("\(name) did not render its central state message")
+        }
+    }
+
+    private static func validateSparseBaseline(_ data: Data?) throws {
+        guard let data, let image = NSBitmapImageRep(data: data),
+              let background = image.colorAt(x: 4, y: 4)?.usingColorSpace(.deviceRGB)
+        else { throw VisualCheckFailure("Could not inspect the sparse all-time render") }
+        let baselineRegion = CGRect(x: 55, y: 132, width: 225, height: 16)
+        var horizontalBins = Set<Int>()
+        let accent = pointNormalizedPixelCount(in: image, region: baselineRegion) { x, y in
+            guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                return false
+            }
+            let components = [color.redComponent, color.greenComponent, color.blueComponent]
+            guard let minimum = components.min(), let maximum = components.max(),
+                  maximum - minimum > 0.10,
+                  colorDistance(color, background) > 0.16
+            else { return false }
+            let pointX = CGFloat(x) * outputSize.width / CGFloat(image.pixelsWide)
+            horizontalBins.insert(Int(pointX / 10))
+            return true
+        }
+        guard accent >= 100, horizontalBins.count >= 10 else {
+            throw VisualCheckFailure(
+                "Sparse all-time line did not visibly return to zero across its calendar gaps"
+            )
+        }
+    }
+
+    private static func pointNormalizedPixelCount(
+        in image: NSBitmapImageRep,
+        region: CGRect,
+        predicate: (Int, Int) -> Bool
+    ) -> CGFloat {
+        let scaleX = CGFloat(image.pixelsWide) / outputSize.width
+        let scaleY = CGFloat(image.pixelsHigh) / outputSize.height
+        let minimumX = max(0, Int((region.minX * scaleX).rounded(.down)))
+        let maximumX = min(image.pixelsWide - 1, Int((region.maxX * scaleX).rounded(.up)))
+        let minimumY = max(0, Int((region.minY * scaleY).rounded(.down)))
+        let maximumY = min(image.pixelsHigh - 1, Int((region.maxY * scaleY).rounded(.up)))
+        var count = 0
+        for y in minimumY...maximumY {
+            for x in minimumX...maximumX where predicate(x, y) {
+                count += 1
+            }
+        }
+        return CGFloat(count) / max(scaleX * scaleY, 1)
     }
 
     private static func colorDistance(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
@@ -195,16 +358,40 @@ enum CodexUsageVisualChecks {
         )
     }
 
-    private static func resolvedOutputDirectory() throws -> URL {
-        if let outputIndex = CommandLine.arguments.firstIndex(of: "--output") {
-            let valueIndex = CommandLine.arguments.index(after: outputIndex)
-            guard CommandLine.arguments.indices.contains(valueIndex) else {
-                throw VisualCheckFailure("--output requires a directory")
-            }
-            return URL(fileURLWithPath: CommandLine.arguments[valueIndex], isDirectory: true)
+    private static func contrastRatio(_ lhs: NSColor, _ rhs: NSColor) -> CGFloat {
+        let lighter = max(relativeLuminance(lhs), relativeLuminance(rhs))
+        let darker = min(relativeLuminance(lhs), relativeLuminance(rhs))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private static func relativeLuminance(_ color: NSColor) -> CGFloat {
+        func linearize(_ component: CGFloat) -> CGFloat {
+            component <= 0.04045
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
         }
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".build/chart-snapshots", isDirectory: true)
+        return (0.2126 * linearize(color.redComponent))
+            + (0.7152 * linearize(color.greenComponent))
+            + (0.0722 * linearize(color.blueComponent))
+    }
+
+    private static func resolvedOutputDirectory() throws -> URL {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.isEmpty {
+            return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+                .appendingPathComponent(".build/chart-snapshots", isDirectory: true)
+        }
+        guard arguments.count == 2,
+              arguments[0] == "--output",
+              !arguments[1].isEmpty,
+              !arguments[1].hasPrefix("--")
+        else {
+            throw VisualCheckFailure(
+                "usage: CodexUsageVisualChecks [--output <directory>]",
+                exitCode: 64
+            )
+        }
+        return URL(fileURLWithPath: arguments[1], isDirectory: true)
     }
 
     private static var renderCases: [RenderCase] {
@@ -212,6 +399,32 @@ enum CodexUsageVisualChecks {
             let wave = Int64((day * day * 83_117) % 4_200_000)
             return day.isMultiple(of: 8) ? 0 : wave + 350_000
         }
+        let calendar = fixtureCalendar
+        let allTimeNow = UsageWindows.date(
+            from: "2026-07-13",
+            timeZone: calendar.timeZone
+        ) ?? Date(timeIntervalSince1970: 1_783_944_000)
+        let sparseAllTimeBuckets = UsageRange(
+            timeframe: .all,
+            sourceBuckets: [
+                DailyUsageBucket(startDate: "2024-01-01", tokens: 120_000),
+                DailyUsageBucket(startDate: "2024-01-15", tokens: 4_200_000),
+                DailyUsageBucket(startDate: "2025-06-01", tokens: 900_000),
+                DailyUsageBucket(startDate: "2026-07-09", tokens: 7_800_000)
+            ],
+            now: allTimeNow,
+            calendar: calendar
+        ).chartBuckets
+        let extremeRange = UsageRange(
+            timeframe: .all,
+            sourceBuckets: [
+                DailyUsageBucket(startDate: "0001-01-01", tokens: 42),
+                DailyUsageBucket(startDate: "0001-01-02", tokens: 20),
+                DailyUsageBucket(startDate: "9999-12-31", tokens: 30)
+            ],
+            now: allTimeNow,
+            calendar: calendar
+        )
         return [
             RenderCase(name: "week-dark", timeframe: .seven, buckets: Array(monthBuckets.suffix(7)), colorScheme: .dark),
             RenderCase(name: "month-light", timeframe: .thirty, buckets: monthBuckets, colorScheme: .light),
@@ -222,21 +435,18 @@ enum CodexUsageVisualChecks {
             RenderCase(
                 name: "all-sparse-dark",
                 timeframe: .all,
-                buckets: [
-                    DailyUsageBucket(startDate: "2024-01-01", tokens: 120_000),
-                    DailyUsageBucket(startDate: "2024-01-15", tokens: 4_200_000),
-                    DailyUsageBucket(startDate: "2025-06-01", tokens: 900_000),
-                    DailyUsageBucket(startDate: "2026-07-09", tokens: 7_800_000)
-                ],
+                buckets: sparseAllTimeBuckets,
                 colorScheme: .dark
             ),
             RenderCase(name: "zero-light", timeframe: .seven, buckets: dailyBuckets(count: 7) { _ in 0 }, colorScheme: .light),
+            RenderCase(name: "empty-light", timeframe: .seven, buckets: [], colorScheme: .light),
             RenderCase(
                 name: "one-point-dark",
                 timeframe: .all,
                 buckets: [DailyUsageBucket(startDate: "2026-07-09", tokens: Int64.max)],
                 colorScheme: .dark,
-                selectedIndex: 0
+                selectedIndex: 0,
+                positions: [1]
             ),
             RenderCase(
                 name: "two-point-light",
@@ -246,6 +456,13 @@ enum CodexUsageVisualChecks {
                     DailyUsageBucket(startDate: "2026-07-09", tokens: 9_999_999_999)
                 ],
                 colorScheme: .light
+            ),
+            RenderCase(
+                name: "extreme-span-light",
+                timeframe: .all,
+                buckets: extremeRange.chartBuckets,
+                colorScheme: .light,
+                positions: extremeRange.chartPositions
             )
         ]
     }
@@ -254,9 +471,10 @@ enum CodexUsageVisualChecks {
         count: Int,
         tokens: (Int) -> Int64
     ) -> [DailyUsageBucket] {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
-        let start = calendar.date(from: DateComponents(year: 2026, month: 4, day: 11)) ?? Date()
+        let calendar = fixtureCalendar
+        guard let start = calendar.date(from: DateComponents(year: 2026, month: 4, day: 11)) else {
+            return []
+        }
         return (0..<count).compactMap { offset in
             guard let date = calendar.date(byAdding: .day, value: offset, to: start) else {
                 return nil
@@ -271,8 +489,10 @@ enum CodexUsageVisualChecks {
 
 private struct VisualCheckFailure: Error, CustomStringConvertible {
     let description: String
+    let exitCode: Int32
 
-    init(_ description: String) {
+    init(_ description: String, exitCode: Int32 = 1) {
         self.description = description
+        self.exitCode = exitCode
     }
 }

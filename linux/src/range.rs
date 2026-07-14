@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{Days, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::model::DailyUsageBucket;
+use crate::model::{DailyUsageBucket, is_canonical_usage_date};
+
+const MAXIMUM_SPARSE_CHART_POINT_COUNT: usize = 20_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -13,6 +15,68 @@ pub enum Timeframe {
     Thirty,
     Ninety,
     All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllTimeSummarySelection {
+    pub total_tokens: Option<i64>,
+    pub peak_daily_tokens: Option<i64>,
+    pub daily_history_partial: bool,
+    pub has_unreconciled_total: bool,
+}
+
+/// Reconciles independently reported all-time summary fields with the daily
+/// series. Summary values can prove that visible daily history is partial, but
+/// they must not produce a total below either the visible or reported peak.
+pub fn reconcile_all_time_summary(
+    daily_history_available: bool,
+    exact_daily_total: Option<i64>,
+    exact_daily_peak: Option<i64>,
+    lifetime_tokens: Option<i64>,
+    summary_peak_daily_tokens: Option<i64>,
+) -> AllTimeSummarySelection {
+    let lifetime = lifetime_tokens.filter(|value| *value >= 0);
+    let summary_peak = summary_peak_daily_tokens.filter(|value| *value >= 0);
+    let peak_daily_tokens = [summary_peak, exact_daily_peak].into_iter().flatten().max();
+
+    let (total_tokens, daily_history_partial) =
+        if daily_history_available && exact_daily_total.is_none() {
+            // A saturated or otherwise inexact daily sum cannot be compared with a
+            // lifetime total. An exact peak can still prove the history is partial.
+            (
+                None,
+                exact_daily_peak.is_some()
+                    && summary_peak.is_some_and(|value| value > exact_daily_peak.unwrap_or(0)),
+            )
+        } else {
+            let daily_history_partial = daily_history_available
+                && (lifetime.is_some_and(|value| value > exact_daily_total.unwrap_or(0))
+                    || summary_peak.is_some_and(|value| value > exact_daily_peak.unwrap_or(0)));
+            let candidate_total = if daily_history_partial {
+                // Once a summary proves the visible daily series is a subset, its
+                // sum is not an exact all-time total. Only a strictly larger
+                // lifetime value can supply the missing history.
+                lifetime.filter(|value| exact_daily_total.is_some_and(|daily| *value > daily))
+            } else {
+                [lifetime, exact_daily_total].into_iter().flatten().max()
+            };
+            (
+                candidate_total.filter(|value| {
+                    peak_daily_tokens.is_none_or(|peak_daily_tokens| *value >= peak_daily_tokens)
+                }),
+                daily_history_partial,
+            )
+        };
+
+    AllTimeSummarySelection {
+        total_tokens,
+        peak_daily_tokens,
+        daily_history_partial,
+        has_unreconciled_total: total_tokens.is_none()
+            && (daily_history_available
+                || lifetime_tokens.is_some()
+                || summary_peak_daily_tokens.is_some()),
+    }
 }
 
 impl Timeframe {
@@ -38,10 +102,10 @@ impl Timeframe {
 
     pub fn history_title(self) -> &'static str {
         match self {
-            Self::Seven => "7-day history",
-            Self::Thirty => "30-day history",
-            Self::Ninety => "90-day history",
-            Self::All => "Daily history",
+            Self::Seven => "Week active-day history",
+            Self::Thirty => "Month active-day history",
+            Self::Ninety => "Quarter active-day history",
+            Self::All => "Active-day history",
         }
     }
 
@@ -58,6 +122,13 @@ impl Timeframe {
 #[derive(Clone, Debug)]
 pub struct UsageRange {
     pub buckets: Vec<DailyUsageBucket>,
+    chart_buckets: Vec<DailyUsageBucket>,
+    calendar_day_count: usize,
+    total_tokens: i64,
+    did_overflow: bool,
+    merge_did_overflow: bool,
+    total_did_overflow: bool,
+    rejected_bucket_count: usize,
 }
 
 impl UsageRange {
@@ -66,14 +137,15 @@ impl UsageRange {
     }
 
     pub fn at_date(timeframe: Timeframe, source: &[DailyUsageBucket], today: NaiveDate) -> Self {
-        let merged = merge_buckets(source);
+        let merged = merge_buckets_reporting_overflow(source);
         let buckets = match timeframe.days() {
-            None => merged,
+            None => merged.buckets.clone(),
             Some(days) => {
-                let first = today
-                    .checked_sub_days(Days::new(days.saturating_sub(1)))
-                    .unwrap_or(today);
+                let Some(first) = today.checked_sub_days(Days::new(days.saturating_sub(1))) else {
+                    return Self::empty(merged.rejected_bucket_count);
+                };
                 let values: BTreeMap<&str, i64> = merged
+                    .buckets
                     .iter()
                     .map(|bucket| (bucket.start_date.as_str(), bucket.tokens))
                     .collect();
@@ -89,19 +161,47 @@ impl UsageRange {
                     .collect()
             }
         };
-        Self { buckets }
+        let chart_buckets = if timeframe == Timeframe::All {
+            sparse_calendar_series(&buckets, today)
+        } else {
+            buckets.clone()
+        };
+        let calendar_day_count = match timeframe.days() {
+            Some(_) => buckets.len(),
+            None => all_time_calendar_day_count(&buckets, today),
+        };
+        let selected_merge_overflow = {
+            let selected_start_dates: BTreeSet<_> = buckets
+                .iter()
+                .map(|bucket| bucket.start_date.as_str())
+                .collect();
+            merged
+                .overflowed_start_dates
+                .iter()
+                .any(|date| selected_start_dates.contains(date.as_str()))
+        };
+        let (total_tokens, total_overflow) = saturating_total(&buckets);
+        Self {
+            buckets,
+            chart_buckets,
+            calendar_day_count,
+            total_tokens,
+            did_overflow: selected_merge_overflow || total_overflow,
+            merge_did_overflow: selected_merge_overflow,
+            total_did_overflow: total_overflow,
+            rejected_bucket_count: merged.rejected_bucket_count,
+        }
     }
 
     pub fn total_tokens(&self) -> i64 {
-        self.buckets.iter().map(|bucket| bucket.tokens).sum()
+        self.total_tokens
     }
 
     pub fn average_daily_tokens(&self) -> i64 {
-        if self.buckets.is_empty() {
-            0
-        } else {
-            self.total_tokens() / self.buckets.len() as i64
-        }
+        i64::try_from(self.calendar_day_count)
+            .ok()
+            .filter(|divisor| *divisor > 0)
+            .map_or(0, |divisor| self.total_tokens / divisor)
     }
 
     pub fn peak_daily_tokens(&self) -> i64 {
@@ -127,97 +227,312 @@ impl UsageRange {
             .collect()
     }
 
-    /// Returns a calendar-contiguous series for plotting without changing the summary math.
+    /// Returns a calendar-positioned series for plotting without changing the summary math.
     /// The app-server can omit inactive dates in all-time data; a chart must represent those
     /// dates at zero instead of drawing a smooth bridge between the surrounding active days.
     pub fn chart_buckets(&self) -> Vec<DailyUsageBucket> {
-        fill_calendar_gaps(&self.buckets)
+        self.chart_buckets.clone()
+    }
+
+    pub fn did_overflow(&self) -> bool {
+        self.did_overflow
+    }
+
+    pub fn merge_did_overflow(&self) -> bool {
+        self.merge_did_overflow
+    }
+
+    pub fn total_did_overflow(&self) -> bool {
+        self.total_did_overflow
+    }
+
+    pub fn rejected_bucket_count(&self) -> usize {
+        self.rejected_bucket_count
+    }
+
+    fn empty(rejected_bucket_count: usize) -> Self {
+        Self {
+            buckets: Vec::new(),
+            chart_buckets: Vec::new(),
+            calendar_day_count: 0,
+            total_tokens: 0,
+            did_overflow: false,
+            merge_did_overflow: false,
+            total_did_overflow: false,
+            rejected_bucket_count,
+        }
     }
 }
 
-fn fill_calendar_gaps(source: &[DailyUsageBucket]) -> Vec<DailyUsageBucket> {
-    let mut tokens_by_date = BTreeMap::<NaiveDate, i64>::new();
-    for bucket in source {
-        let Ok(date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") else {
-            // Preserve unusual future app-server data rather than silently dropping it.
-            return source.to_vec();
-        };
-        *tokens_by_date.entry(date).or_default() += bucket.tokens;
-    }
-    let Some(first) = tokens_by_date.keys().next().copied() else {
+fn all_time_calendar_day_count(source: &[DailyUsageBucket], today: NaiveDate) -> usize {
+    let Some(first) = source
+        .first()
+        .and_then(|bucket| NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok())
+    else {
+        return 0;
+    };
+    let last = source
+        .last()
+        .and_then(|bucket| NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok())
+        .unwrap_or(first);
+    let endpoint = last.max(today);
+    usize::try_from((endpoint - first).num_days())
+        .ok()
+        .and_then(|distance| distance.checked_add(1))
+        .unwrap_or(usize::MAX)
+}
+
+/// Insert only the zero-valued boundaries required to prevent a chart from
+/// smoothing across omitted idle spans. This remains bounded even when two
+/// source dates are years apart.
+fn sparse_calendar_series(source: &[DailyUsageBucket], today: NaiveDate) -> Vec<DailyUsageBucket> {
+    let Some(first) = source.first().cloned() else {
         return Vec::new();
     };
-    let last = tokens_by_date.keys().next_back().copied().unwrap_or(first);
-    let day_count = (last - first).num_days().max(0) as u64;
-    (0..=day_count)
-        .filter_map(|offset| first.checked_add_days(Days::new(offset)))
-        .map(|date| DailyUsageBucket {
-            start_date: date.format("%Y-%m-%d").to_string(),
-            tokens: tokens_by_date.get(&date).copied().unwrap_or(0),
-        })
-        .collect()
+    let Some(mut previous_date) = NaiveDate::parse_from_str(&first.start_date, "%Y-%m-%d").ok()
+    else {
+        return Vec::new();
+    };
+    let mut result = Vec::with_capacity(
+        source
+            .len()
+            .saturating_mul(3)
+            .min(MAXIMUM_SPARSE_CHART_POINT_COUNT),
+    );
+    append_bounded_chart_bucket(&mut result, first);
+
+    for bucket in source.iter().skip(1) {
+        let Ok(current_date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") else {
+            continue;
+        };
+        let gap = (current_date - previous_date).num_days();
+        if gap > 1
+            && let Some(after_previous) = previous_date.checked_add_days(Days::new(1))
+        {
+            append_bounded_chart_bucket(
+                &mut result,
+                DailyUsageBucket {
+                    start_date: after_previous.format("%Y-%m-%d").to_string(),
+                    tokens: 0,
+                },
+            );
+            if gap > 2
+                && let Some(before_current) = current_date.checked_sub_days(Days::new(1))
+            {
+                append_bounded_chart_bucket(
+                    &mut result,
+                    DailyUsageBucket {
+                        start_date: before_current.format("%Y-%m-%d").to_string(),
+                        tokens: 0,
+                    },
+                );
+            }
+        }
+        append_bounded_chart_bucket(&mut result, bucket.clone());
+        previous_date = current_date;
+    }
+
+    let trailing_gap = (today - previous_date).num_days();
+    if trailing_gap > 0
+        && let Some(next) = previous_date.checked_add_days(Days::new(1))
+    {
+        append_bounded_chart_bucket(
+            &mut result,
+            DailyUsageBucket {
+                start_date: next.format("%Y-%m-%d").to_string(),
+                tokens: 0,
+            },
+        );
+        if trailing_gap > 1 {
+            append_bounded_chart_bucket(
+                &mut result,
+                DailyUsageBucket {
+                    start_date: today.format("%Y-%m-%d").to_string(),
+                    tokens: 0,
+                },
+            );
+        }
+    }
+    bounded_chart_series(&result, MAXIMUM_SPARSE_CHART_POINT_COUNT)
 }
 
-pub fn merge_buckets(source: &[DailyUsageBucket]) -> Vec<DailyUsageBucket> {
+struct MergeResult {
+    buckets: Vec<DailyUsageBucket>,
+    overflowed_start_dates: BTreeSet<String>,
+    rejected_bucket_count: usize,
+}
+
+fn merge_buckets_reporting_overflow(source: &[DailyUsageBucket]) -> MergeResult {
     let mut totals = BTreeMap::<String, i64>::new();
+    let mut overflowed_start_dates = BTreeSet::new();
+    let mut rejected_bucket_count = 0;
     for bucket in source {
-        *totals.entry(bucket.start_date.clone()).or_default() += bucket.tokens;
+        if !is_canonical_usage_date(&bucket.start_date) || bucket.tokens < 0 {
+            rejected_bucket_count += 1;
+            continue;
+        }
+        let total = totals.entry(bucket.start_date.clone()).or_default();
+        match total.checked_add(bucket.tokens) {
+            Some(value) => *total = value,
+            None => {
+                *total = i64::MAX;
+                overflowed_start_dates.insert(bucket.start_date.clone());
+            }
+        }
     }
-    totals
-        .into_iter()
-        .map(|(start_date, tokens)| DailyUsageBucket { start_date, tokens })
-        .collect()
+    MergeResult {
+        buckets: totals
+            .into_iter()
+            .map(|(start_date, tokens)| DailyUsageBucket { start_date, tokens })
+            .collect(),
+        overflowed_start_dates,
+        rejected_bucket_count,
+    }
+}
+
+fn saturating_total(source: &[DailyUsageBucket]) -> (i64, bool) {
+    let mut total: i64 = 0;
+    let mut did_overflow = false;
+    for bucket in source {
+        match total.checked_add(bucket.tokens.max(0)) {
+            Some(value) => total = value,
+            None => {
+                total = i64::MAX;
+                did_overflow = true;
+            }
+        }
+    }
+    (total, did_overflow)
+}
+
+fn append_bounded_chart_bucket(result: &mut Vec<DailyUsageBucket>, bucket: DailyUsageBucket) {
+    if result
+        .last()
+        .is_some_and(|last| last.start_date == bucket.start_date)
+    {
+        if let Some(last) = result.last_mut() {
+            *last = bucket;
+        }
+        return;
+    }
+    if result.len() >= MAXIMUM_SPARSE_CHART_POINT_COUNT {
+        *result = bounded_chart_series(result, MAXIMUM_SPARSE_CHART_POINT_COUNT / 2);
+    }
+    result.push(bucket);
+}
+
+fn bounded_chart_series(source: &[DailyUsageBucket], limit: usize) -> Vec<DailyUsageBucket> {
+    if limit < 2 || source.len() <= limit {
+        return source.to_vec();
+    }
+    let last_index = source.len() - 1;
+    let interior_count = last_index - 1;
+    let bin_count = ((limit - 2) / 2).max(1);
+    let mut result = Vec::with_capacity(limit);
+    result.push(source[0].clone());
+    for bin in 0..bin_count {
+        let start = 1 + (bin * interior_count / bin_count);
+        let end = 1 + ((bin + 1) * interior_count / bin_count);
+        if start >= end {
+            continue;
+        }
+        let mut minimum = start;
+        let mut maximum = start;
+        for index in (start + 1)..end {
+            if source[index].tokens < source[minimum].tokens {
+                minimum = index;
+            }
+            if source[index].tokens > source[maximum].tokens {
+                maximum = index;
+            }
+        }
+        let mut extrema = [minimum, maximum];
+        extrema.sort_unstable();
+        for index in extrema {
+            if result
+                .last()
+                .is_none_or(|bucket| bucket.start_date != source[index].start_date)
+            {
+                result.push(source[index].clone());
+            }
+        }
+    }
+    if result
+        .last()
+        .is_none_or(|bucket| bucket.start_date != source[last_index].start_date)
+    {
+        result.push(source[last_index].clone());
+    }
+    result
 }
 
 pub fn format_tokens(value: i64) -> String {
     let absolute = value.unsigned_abs() as f64;
     let sign = if value < 0 { "-" } else { "" };
-    let (scaled, suffix, maximum_fraction_digits) = if absolute < 1_000.0 {
+    if absolute < 1_000.0 {
         return value.to_string();
-    } else if absolute < 1_000_000.0 {
-        (absolute / 1_000.0, "K", 1)
-    } else if absolute < 1_000_000_000.0 {
-        (absolute / 1_000_000.0, "M", 1)
-    } else if absolute < 1_000_000_000_000.0 {
-        (absolute / 1_000_000_000.0, "B", 3)
-    } else {
-        (absolute / 1_000_000_000_000.0, "T", 2)
-    };
-    let precision = if scaled >= 100.0 {
-        0
-    } else {
-        maximum_fraction_digits
-    };
-    format!("{sign}{scaled:.precision$}{suffix}")
+    }
+    let divisors = [
+        1.0,
+        1_000.0,
+        1_000_000.0,
+        1_000_000_000.0,
+        1_000_000_000_000.0,
+    ];
+    let suffixes = ["", "K", "M", "B", "T"];
+    let fraction_digits: [usize; 5] = [0, 1, 1, 3, 2];
+    let mut unit = ((absolute.log10() / 3.0).floor() as usize).min(suffixes.len() - 1);
+    loop {
+        let scaled = absolute / divisors[unit];
+        let precision = if scaled >= 100.0 {
+            0
+        } else {
+            fraction_digits[unit]
+        };
+        let scale = 10_f64.powi(precision as i32);
+        let rounded = (scaled * scale).round() / scale;
+        if rounded >= 1_000.0 && unit < suffixes.len() - 1 {
+            unit += 1;
+            continue;
+        }
+        return format!("{sign}{rounded:.precision$}{}", suffixes[unit]);
+    }
 }
 
 pub fn format_axis_tokens(value: i64) -> String {
     let absolute = value.unsigned_abs() as f64;
     let sign = if value < 0 { "-" } else { "" };
-    let (scaled, suffix) = if absolute < 1_000.0 {
+    if absolute < 1_000.0 {
         return value.to_string();
-    } else if absolute < 1_000_000.0 {
-        (absolute / 1_000.0, "K")
-    } else if absolute < 1_000_000_000.0 {
-        (absolute / 1_000_000.0, "M")
-    } else if absolute < 1_000_000_000_000.0 {
-        (absolute / 1_000_000_000.0, "B")
-    } else {
-        (absolute / 1_000_000_000_000.0, "T")
-    };
-    let mut number = format!("{scaled:.1}");
-    while number.contains('.') && number.ends_with('0') {
-        number.pop();
     }
-    if number.ends_with('.') {
-        number.pop();
+    if absolute >= 1_000_000_000_000_000.0 {
+        return format!("{:.1e}", value as f64)
+            .replace("e+", "e")
+            .replace("e0", "e");
     }
-    let (whole, fraction) = number.split_once('.').unwrap_or((&number, ""));
-    let grouped = group_digits(whole);
-    if fraction.is_empty() {
-        format!("{sign}{grouped}{suffix}")
-    } else {
-        format!("{sign}{grouped}.{fraction}{suffix}")
+    let divisors = [
+        1.0,
+        1_000.0,
+        1_000_000.0,
+        1_000_000_000.0,
+        1_000_000_000_000.0,
+    ];
+    let suffixes = ["", "K", "M", "B", "T"];
+    let mut unit = ((absolute.log10() / 3.0).floor() as usize).min(suffixes.len() - 1);
+    loop {
+        let rounded = (absolute / divisors[unit] * 10.0).round() / 10.0;
+        if rounded >= 1_000.0 && unit < suffixes.len() - 1 {
+            unit += 1;
+            continue;
+        }
+        let mut number = format!("{rounded:.1}");
+        while number.contains('.') && number.ends_with('0') {
+            number.pop();
+        }
+        if number.ends_with('.') {
+            number.pop();
+        }
+        return format!("{sign}{number}{}", suffixes[unit]);
     }
 }
 
@@ -242,18 +557,18 @@ pub fn nice_axis_maximum(value: i64) -> i64 {
     if value <= 0 {
         return 0;
     }
-    let magnitude = 10_f64.powf((value as f64).log10().floor());
-    let normalized = value as f64 / magnitude;
-    let nice = if normalized <= 1.0 {
-        1.0
-    } else if normalized <= 2.0 {
-        2.0
-    } else if normalized <= 5.0 {
-        5.0
-    } else {
-        10.0
-    };
-    (nice * magnitude).round().min(i64::MAX as f64) as i64
+    let mut magnitude = 1_i64;
+    while value / magnitude >= 10 && magnitude <= i64::MAX / 10 {
+        magnitude *= 10;
+    }
+    for multiplier in [1_i64, 2, 5, 10] {
+        if let Some(candidate) = magnitude.checked_mul(multiplier)
+            && candidate >= value
+        {
+            return candidate;
+        }
+    }
+    i64::MAX
 }
 
 #[cfg(test)]
@@ -330,7 +645,49 @@ mod tests {
         );
         assert_eq!(range.active_days(), 2);
         assert_eq!(range.peak_daily_tokens(), 25);
-        assert_eq!(range.average_daily_tokens(), 10);
+        assert_eq!(range.average_daily_tokens(), 7);
+    }
+
+    #[test]
+    fn all_time_summary_reconciliation_never_claims_impossible_totals() {
+        let complete = reconcile_all_time_summary(true, Some(500), Some(300), Some(500), Some(300));
+        assert_eq!(complete.total_tokens, Some(500));
+        assert_eq!(complete.peak_daily_tokens, Some(300));
+        assert!(!complete.daily_history_partial);
+        assert!(!complete.has_unreconciled_total);
+
+        let partial = reconcile_all_time_summary(true, Some(500), Some(300), Some(900), Some(700));
+        assert_eq!(partial.total_tokens, Some(900));
+        assert_eq!(partial.peak_daily_tokens, Some(700));
+        assert!(partial.daily_history_partial);
+        assert!(!partial.has_unreconciled_total);
+
+        let no_credible_lifetime =
+            reconcile_all_time_summary(true, Some(500), Some(300), Some(500), Some(700));
+        assert_eq!(no_credible_lifetime.total_tokens, None);
+        assert_eq!(no_credible_lifetime.peak_daily_tokens, Some(700));
+        assert!(no_credible_lifetime.daily_history_partial);
+        assert!(no_credible_lifetime.has_unreconciled_total);
+
+        let below_peak = reconcile_all_time_summary(false, None, None, Some(100), Some(800));
+        assert_eq!(below_peak.total_tokens, None);
+        assert_eq!(below_peak.peak_daily_tokens, Some(800));
+        assert!(!below_peak.daily_history_partial);
+        assert!(below_peak.has_unreconciled_total);
+    }
+
+    #[test]
+    fn partial_daily_history_requires_a_strictly_larger_lifetime_total() {
+        for lifetime in [None, Some(499), Some(500)] {
+            let selection =
+                reconcile_all_time_summary(true, Some(500), Some(300), lifetime, Some(700));
+            assert_eq!(selection.total_tokens, None, "lifetime={lifetime:?}");
+            assert!(selection.daily_history_partial);
+            assert!(selection.has_unreconciled_total);
+        }
+        let credible = reconcile_all_time_summary(true, Some(500), Some(300), Some(701), Some(700));
+        assert_eq!(credible.total_tokens, Some(701));
+        assert!(!credible.has_unreconciled_total);
     }
 
     #[test]
@@ -351,7 +708,7 @@ mod tests {
             ]
         );
         assert_eq!(range.buckets.len(), 2);
-        assert_eq!(range.average_daily_tokens(), 65);
+        assert_eq!(range.average_daily_tokens(), 32);
     }
 
     #[test]
@@ -376,11 +733,92 @@ mod tests {
         assert_eq!(format_tokens(1_250_000_000), "1.250B");
         assert_eq!(format_tokens(150_400_000_000), "150B");
         assert_eq!(format_tokens(4_181_000_000), "4.181B");
+        assert_eq!(format_tokens(999_999), "1.0M");
         assert_eq!(format_axis_tokens(500_000), "500K");
         assert_eq!(format_axis_tokens(5_000_000_000), "5B");
         assert_eq!(format_axis_tokens(2_500_000_000), "2.5B");
-        assert_eq!(format_axis_tokens(i64::MAX), "9,223,372T");
+        assert_eq!(format_axis_tokens(999_999), "1M");
+        assert_eq!(format_axis_tokens(i64::MAX), "9.2e18");
         assert_eq!(format_full_tokens(12_345_678), "12,345,678");
         assert_eq!(nice_axis_maximum(4_181_000_000), 5_000_000_000);
+        assert_eq!(nice_axis_maximum(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn invalid_negative_and_overflowing_buckets_are_safe_and_observable() {
+        let range = UsageRange::at_date(
+            Timeframe::All,
+            &[
+                bucket("2026-07-08", i64::MAX),
+                bucket("2026-07-08", 1),
+                bucket("2026-07-09", i64::MAX),
+                bucket("not-a-date", 10),
+                bucket("2026-07-10", -1),
+            ],
+            NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(),
+        );
+        assert_eq!(range.total_tokens(), i64::MAX);
+        assert!(range.did_overflow());
+        assert!(range.merge_did_overflow());
+        assert!(range.total_did_overflow());
+        assert_eq!(range.rejected_bucket_count(), 2);
+        assert_eq!(range.buckets.len(), 2);
+    }
+
+    #[test]
+    fn overflow_outside_a_fixed_window_does_not_poison_the_selected_total() {
+        let range = UsageRange::at_date(
+            Timeframe::Seven,
+            &[
+                bucket("2020-01-01", i64::MAX),
+                bucket("2020-01-01", 1),
+                bucket("2026-07-09", 100),
+            ],
+            NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(),
+        );
+        assert_eq!(range.total_tokens(), 100);
+        assert!(!range.did_overflow());
+        assert!(!range.merge_did_overflow());
+        assert!(!range.total_did_overflow());
+    }
+
+    #[test]
+    fn total_overflow_is_distinct_from_same_day_merge_overflow() {
+        let range = UsageRange::at_date(
+            Timeframe::All,
+            &[bucket("2026-07-08", i64::MAX), bucket("2026-07-09", 1)],
+            NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(),
+        );
+        assert!(range.did_overflow());
+        assert!(!range.merge_did_overflow());
+        assert!(range.total_did_overflow());
+    }
+
+    #[test]
+    fn all_time_average_counts_omitted_and_trailing_calendar_days() {
+        let range = UsageRange::at_date(
+            Timeframe::All,
+            &[bucket("2026-07-01", 90), bucket("2026-07-03", 10)],
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+        );
+        assert_eq!(range.total_tokens(), 100);
+        assert_eq!(range.average_daily_tokens(), 10);
+        assert_eq!(
+            range.chart_buckets().last().unwrap(),
+            &bucket("2026-07-10", 0)
+        );
+    }
+
+    #[test]
+    fn all_time_chart_is_sparse_across_extreme_date_gaps() {
+        let range = UsageRange::at_date(
+            Timeframe::All,
+            &[bucket("0001-01-01", 1), bucket("9999-12-31", 2)],
+            NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(),
+        );
+        let chart = range.chart_buckets();
+        assert_eq!(chart.len(), 4);
+        assert_eq!(chart.first().unwrap(), &bucket("0001-01-01", 1));
+        assert_eq!(chart.last().unwrap(), &bucket("9999-12-31", 2));
     }
 }

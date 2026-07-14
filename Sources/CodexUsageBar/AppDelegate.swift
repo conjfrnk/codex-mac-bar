@@ -34,6 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.title = viewModel.statusTitle
         button.image = UsageMenuBarIcon.image
         button.imagePosition = .imageLeading
+        Self.configureStatusButtonAccessibility(
+            button,
+            value: viewModel.statusAccessibilityValue
+        )
         statusItem.menu = menu
     }
 
@@ -74,11 +78,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateStatusTitle() {
-        statusItem.button?.title = viewModel.statusTitle
+        guard let button = statusItem.button else { return }
+        button.title = viewModel.statusTitle
+        Self.configureStatusButtonAccessibility(
+            button,
+            value: viewModel.statusAccessibilityValue
+        )
+    }
+
+    static func configureStatusButtonAccessibility(
+        _ button: NSStatusBarButton,
+        value: String
+    ) {
+        button.setAccessibilityLabel("Codex usage")
+        button.setAccessibilityValue(value)
+        button.setAccessibilityHelp("Open the Codex usage menu")
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         // Changing app activation while this menu begins tracking can dismiss it immediately.
+        viewModel.beginMenuSession()
         resetUsageScrollPosition()
         if viewModel.shouldRefresh(maxAge: Self.refreshInterval) {
             viewModel.refresh()
@@ -91,9 +110,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// than through SwiftUI state — that update path isn't guaranteed to land before the
     /// menu draws, since NSMenu shows itself right after this delegate call returns.
     private func resetUsageScrollPosition() {
-        guard let hostingView = usageHostingView,
-              let scrollView = cachedUsageScrollView ?? Self.findScrollView(in: hostingView)
-        else { return }
+        guard let hostingView = usageHostingView else { return }
+        let cached = cachedUsageScrollView.flatMap { scrollView in
+            Self.isDescendant(scrollView, of: hostingView) ? scrollView : nil
+        }
+        guard let scrollView = cached ?? Self.findScrollView(in: hostingView) else {
+            cachedUsageScrollView = nil
+            return
+        }
         cachedUsageScrollView = scrollView
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -111,11 +135,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
+    private static func isDescendant(_ candidate: NSView, of root: NSView) -> Bool {
+        var current: NSView? = candidate
+        while let view = current {
+            if view === root { return true }
+            current = view.superview
+        }
+        return false
+    }
+
     private func startAutoRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.viewModel.refresh()
+                guard let self else { return }
+                // The timer is created before the initial request completes, so an
+                // age gate at this exact cadence can miss by a fraction of a second
+                // and defer every refresh until the next timer tick. Refresh
+                // itself deduplicates any request already in flight.
+                self.viewModel.refresh()
             }
         }
         if let refreshTimer {

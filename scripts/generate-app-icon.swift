@@ -1,5 +1,3 @@
-#!/usr/bin/env swift
-
 import AppKit
 import Foundation
 
@@ -8,6 +6,7 @@ guard CommandLine.arguments.count == 2 else {
     exit(64)
 }
 
+do {
 let outputURL = URL(fileURLWithPath: CommandLine.arguments[1])
 let fileManager = FileManager.default
 let iconsetURL = fileManager.temporaryDirectory
@@ -30,31 +29,95 @@ for (points, scale) in icons {
     let pixels = points * scale
     let suffix = scale == 1 ? "" : "@\(scale)x"
     let filename = "icon_\(points)x\(points)\(suffix).png"
-    let data = pngIcon(size: pixels)
+    let data = try pngIcon(size: pixels)
+    guard let representation = NSBitmapImageRep(data: data),
+          representation.pixelsWide == pixels,
+          representation.pixelsHigh == pixels
+    else {
+        throw IconGenerationError("\(filename) was not rendered at exactly \(pixels)x\(pixels) pixels")
+    }
     try data.write(to: iconsetURL.appendingPathComponent(filename))
 }
 
-try? fileManager.removeItem(at: outputURL)
 try fileManager.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+let generatedURL = outputURL.deletingLastPathComponent()
+    .appendingPathComponent(".\(outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).icns")
+defer {
+    try? fileManager.removeItem(at: generatedURL)
+}
 
 let process = Process()
 process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-process.arguments = ["-c", "icns", iconsetURL.path, "-o", outputURL.path]
+process.arguments = ["-c", "icns", iconsetURL.path, "-o", generatedURL.path]
 try process.run()
 process.waitUntilExit()
 
 if process.terminationStatus != 0 {
-    fputs("iconutil failed with status \(process.terminationStatus)\n", stderr)
-    exit(process.terminationStatus)
+    // Throw through the surrounding scope so both temporary-artifact defers
+    // execute. Calling exit() here would leak the populated iconset directory.
+    throw IconGenerationError("iconutil failed with status \(process.terminationStatus)")
 }
 
-private func pngIcon(size: Int) -> Data {
+guard let packedIcon = NSImage(contentsOf: generatedURL) else {
+    throw IconGenerationError("Could not reopen the generated ICNS")
+}
+let expectedRepresentations = Set(icons.map { points, scale in
+    "\(points)pt:\(points * scale)px"
+})
+let actualRepresentations = packedIcon.representations.compactMap { representation -> String? in
+    let pointWidth = Int(representation.size.width.rounded())
+    let pointHeight = Int(representation.size.height.rounded())
+    guard representation.size.width == CGFloat(pointWidth),
+          representation.size.height == CGFloat(pointHeight),
+          pointWidth == pointHeight,
+          representation.pixelsWide == representation.pixelsHigh
+    else { return nil }
+    return "\(pointWidth)pt:\(representation.pixelsWide)px"
+}
+guard actualRepresentations.count == icons.count,
+      Set(actualRepresentations) == expectedRepresentations
+else {
+    throw IconGenerationError(
+        "Generated ICNS has incomplete representations: \(actualRepresentations.sorted())"
+    )
+}
+
+if fileManager.fileExists(atPath: outputURL.path) {
+    _ = try fileManager.replaceItemAt(outputURL, withItemAt: generatedURL)
+} else {
+    try fileManager.moveItem(at: generatedURL, to: outputURL)
+}
+} catch {
+    // All generation work lives inside the `do` scope, so its cleanup defers
+    // have completed before this process-level failure is reported.
+    fputs("icon generation failed: \(error)\n", stderr)
+    exit(1)
+}
+
+private func pngIcon(size: Int) throws -> Data {
     let canvas = NSSize(width: size, height: size)
     let scale = CGFloat(size) / 1024.0
-    let image = NSImage(size: canvas)
+    guard let bitmap = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: size,
+        pixelsHigh: size,
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
+    ), let graphicsContext = NSGraphicsContext(bitmapImageRep: bitmap) else {
+        throw IconGenerationError("Could not allocate an exact-size \(size)x\(size) icon bitmap")
+    }
+    bitmap.size = canvas
 
-    image.lockFocus()
-    NSGraphicsContext.current?.imageInterpolation = .high
+    let previousContext = NSGraphicsContext.current
+    NSGraphicsContext.current = graphicsContext
+    NSGraphicsContext.saveGraphicsState()
+    graphicsContext.imageInterpolation = .high
+    graphicsContext.cgContext.clear(CGRect(origin: .zero, size: canvas))
 
     let tile = NSRect(x: 78 * scale, y: 78 * scale, width: 868 * scale, height: 868 * scale)
     let radius = 218 * scale
@@ -79,16 +142,21 @@ private func pngIcon(size: Int) -> Data {
     tilePath.lineWidth = max(1, 2.2 * scale)
     tilePath.stroke()
 
-    image.unlockFocus()
+    NSGraphicsContext.restoreGraphicsState()
+    NSGraphicsContext.current = previousContext
 
-    guard
-        let tiff = image.tiffRepresentation,
-        let bitmap = NSBitmapImageRep(data: tiff),
-        let data = bitmap.representation(using: .png, properties: [:])
-    else {
-        fatalError("Could not render icon")
+    guard let data = bitmap.representation(using: .png, properties: [:]) else {
+        throw IconGenerationError("Could not encode the \(size)x\(size) icon bitmap")
     }
     return data
+}
+
+private struct IconGenerationError: Error, CustomStringConvertible {
+    let description: String
+
+    init(_ description: String) {
+        self.description = description
+    }
 }
 
 private func drawShadowedBase(_ path: NSBezierPath) {

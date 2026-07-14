@@ -1,10 +1,20 @@
 import CodexUsageCore
+import Foundation
 import SwiftUI
 
 public struct UsageLineChart: View {
     private let buckets: [DailyUsageBucket]
     private let maxTokens: Int64
     private let timeframe: UsageTimeframe
+    private let positions: [Double]
+    private let axisPolicy: UsageChartAxisPolicy
+    private let calendar: Calendar
+    private let axisDateFormatter: DateFormatter
+    private let tooltipDateFormatter: DateFormatter
+    private let locale: Locale
+    private let selectedIndex: Int?
+
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var hoveredIndex: Int?
     @State private var pinnedIndex: Int?
@@ -18,40 +28,6 @@ public struct UsageLineChart: View {
 
     private var hasActivity: Bool {
         maxTokens > 0 && buckets.contains { $0.tokens > 0 }
-    }
-
-    private var positions: [Double] {
-        guard buckets.count > 1 else {
-            return buckets.isEmpty ? [] : [0.5]
-        }
-        let dates = buckets.compactMap { UsageWindows.date(from: $0.startDate) }
-        guard dates.count == buckets.count,
-              let firstDate = dates.first,
-              let lastDate = dates.last
-        else { return evenlySpacedPositions }
-
-        let duration = lastDate.timeIntervalSince(firstDate)
-        guard duration > 0 else { return evenlySpacedPositions }
-        return dates.map { $0.timeIntervalSince(firstDate) / duration }
-    }
-
-    private var evenlySpacedPositions: [Double] {
-        guard buckets.count > 1 else {
-            return buckets.isEmpty ? [] : [0.5]
-        }
-        let denominator = Double(buckets.count - 1)
-        return buckets.indices.map { Double($0) / denominator }
-    }
-
-    private var axisPolicy: UsageChartAxisPolicy {
-        UsageChartAxisPolicy.policy(for: timeframe, spanDays: spanDays)
-    }
-
-    private var spanDays: Int? {
-        guard let first = buckets.first.flatMap({ UsageWindows.date(from: $0.startDate) }),
-              let last = buckets.last.flatMap({ UsageWindows.date(from: $0.startDate) })
-        else { return nil }
-        return Calendar.current.dateComponents([.day], from: first, to: last).day.map(abs)
     }
 
     /// The peak token count rounded up to a "nice" round number (see
@@ -75,19 +51,122 @@ public struct UsageLineChart: View {
         axisPolicy.dateLabelStyle == .singleLetterWeekday ? 18 : 56
     }
 
+    /// Approximate rendered glyph width, distinct from the deliberately wider
+    /// alignment frame. Collision filtering the transparent 56pt frame would
+    /// unnecessarily remove ordinary month ticks whose text is only ~20pt wide.
+    private var tickCollisionWidth: CGFloat {
+        switch axisPolicy.dateLabelStyle {
+        case .singleLetterWeekday: return 18
+        case .abbreviatedWeekday: return 30
+        case .numericMonthDay: return 32
+        case .abbreviatedMonthDay: return 42
+        case .abbreviatedMonthYear: return 56
+        }
+    }
+
+    /// A darkened teal is used in light appearance because the system mint color
+    /// is too close to white for a thin chart stroke. These fixed values retain
+    /// greater than 3:1 contrast against the chart's light and dark backgrounds.
+    private var accentColor: Color {
+        switch colorScheme {
+        case .dark:
+            return Color(red: 0.42, green: 0.97, blue: 0.86)
+        default:
+            return Color(red: 0.00, green: 0.42, blue: 0.35)
+        }
+    }
+
     public init(
         buckets: [DailyUsageBucket],
         maxTokens: Int64,
         timeframe: UsageTimeframe,
-        selectedIndex: Int? = nil
+        selectedIndex: Int? = nil,
+        positions suppliedPositions: [Double]? = nil,
+        calendar: Calendar = .autoupdatingCurrent,
+        locale: Locale = .autoupdatingCurrent
     ) {
-        self.buckets = buckets
-        self.maxTokens = maxTokens
+        let normalizedBuckets = buckets.map { bucket in
+            DailyUsageBucket(startDate: bucket.startDate, tokens: max(bucket.tokens, 0))
+        }
+        let canonicalPositions = UsageChartMath.normalizedCalendarDayPositions(for: normalizedBuckets)
+        let positions: [Double]
+        if let suppliedPositions,
+           Self.validPositions(suppliedPositions, count: normalizedBuckets.count) {
+            positions = suppliedPositions
+        } else {
+            positions = canonicalPositions
+        }
+        let policy = UsageChartAxisPolicy.policy(
+            for: timeframe,
+            spanDays: UsageChartMath.calendarDaySpan(for: normalizedBuckets)
+        )
+        self.buckets = normalizedBuckets
+        let observedMaximum = normalizedBuckets.map(\.tokens).max() ?? 0
+        self.maxTokens = max(max(maxTokens, 0), observedMaximum)
         self.timeframe = timeframe
-        _pinnedIndex = State(initialValue: selectedIndex)
+        self.positions = positions
+        self.calendar = calendar
+        self.locale = locale
+        self.selectedIndex = selectedIndex.flatMap {
+            normalizedBuckets.indices.contains($0) ? $0 : nil
+        }
+        axisPolicy = policy
+        axisDateFormatter = Self.makeAxisDateFormatter(
+            style: policy.dateLabelStyle,
+            calendar: calendar,
+            locale: locale
+        )
+        tooltipDateFormatter = Self.makeTooltipDateFormatter(
+            calendar: calendar,
+            locale: locale
+        )
+        // Treat the public selection as untrusted input. Keeping an out-of-range
+        // value would be visually inert at first, but an arrow-key command could
+        // then overflow (`Int.min - 1`) or carry an invalid index indefinitely.
+        _pinnedIndex = State(
+            initialValue: self.selectedIndex
+        )
+    }
+
+    static func validPositions(_ positions: [Double], count: Int) -> Bool {
+        guard positions.count == count,
+              positions.allSatisfy(\.isFinite)
+        else { return false }
+        if count == 0 { return true }
+        if count == 1 {
+            return positions[0] >= 0 && positions[0] <= 1
+        }
+        guard let first = positions.first,
+              let last = positions.last,
+              abs(first) <= 1e-12,
+              abs(last - 1) <= 1e-12
+        else { return false }
+        let minimumInterval = 1e-12
+        return zip(positions, positions.dropFirst()).allSatisfy {
+            let interval = $1 - $0
+            return interval.isFinite && interval >= minimumInterval
+        }
     }
 
     public var body: some View {
+        if buckets.isEmpty {
+            chartContent
+        } else {
+            chartContent
+                .accessibilityAdjustableAction { direction in
+                    switch direction {
+                    case .increment:
+                        moveSelection(.right)
+                    case .decrement:
+                        moveSelection(.left)
+                    @unknown default:
+                        break
+                    }
+                }
+        }
+    }
+
+    private var chartContent: some View {
         GeometryReader { proxy in
             let layout = ChartLayout(size: proxy.size)
 
@@ -95,7 +174,7 @@ public struct UsageLineChart: View {
                 axes(in: layout)
                 usageLine(in: layout)
 
-                if !hasActivity {
+                if buckets.isEmpty || !hasActivity {
                     Text("No activity")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.secondary)
@@ -103,7 +182,7 @@ public struct UsageLineChart: View {
                         .allowsHitTesting(false)
                 } else if buckets.count == 1 {
                     Circle()
-                        .fill(Color.mint)
+                        .fill(accentColor)
                         .frame(width: 7, height: 7)
                         .position(point(for: 0, in: layout))
                         .allowsHitTesting(false)
@@ -113,33 +192,34 @@ public struct UsageLineChart: View {
                     activeSelection(at: activeIndex, in: layout)
                 }
 
-                interactionLayer(in: layout)
+                if !buckets.isEmpty {
+                    interactionLayer(in: layout)
+                }
 
                 if let activeIndex, buckets.indices.contains(activeIndex) {
                     tooltip(at: activeIndex, in: layout)
                 }
             }
         }
-        .onChange(of: buckets) { _ in
-            resetSelection()
+        .onChange(of: buckets) { newBuckets in
+            synchronizeExternalSelection(
+                to: selectedIndex.flatMap { newBuckets.indices.contains($0) ? $0 : nil }
+            )
         }
         .onChange(of: timeframe) { _ in
-            resetSelection()
+            synchronizeExternalSelection(to: selectedIndex)
+        }
+        .onChange(of: selectedIndex) { newIndex in
+            synchronizeExternalSelection(to: newIndex)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Daily token usage chart")
         .accessibilityValue(accessibilityValue)
-        .accessibilityHint("Move the pointer, click, or use the left and right arrow keys to inspect daily values.")
-        .accessibilityAdjustableAction { direction in
-            switch direction {
-            case .increment:
-                moveSelection(.right)
-            case .decrement:
-                moveSelection(.left)
-            @unknown default:
-                break
-            }
-        }
+        .accessibilityHint(
+            buckets.isEmpty
+                ? "There is no daily activity to inspect."
+                : "Move the pointer, click, or use the left and right arrow keys to inspect daily values."
+        )
     }
 
     @ViewBuilder
@@ -159,7 +239,7 @@ public struct UsageLineChart: View {
             }
             .stroke(Color.secondary.opacity(0.20), lineWidth: 1)
 
-            Text(UsageFormatting.axisTokens(value))
+            Text(UsageChartAxisLabel.text(value))
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -175,9 +255,11 @@ public struct UsageLineChart: View {
         }
         .stroke(Color.secondary.opacity(0.32), lineWidth: 1)
 
-        let tickIndices = UsageChartMath.tickIndices(
+        let tickIndices = Self.nonoverlappingTickIndices(
             positions: positions,
-            maximumTickCount: axisPolicy.maximumTickCount
+            maximumTickCount: axisPolicy.maximumTickCount,
+            plotWidth: layout.plotRect.width,
+            labelWidth: tickCollisionWidth
         )
         ForEach(tickIndices, id: \.self) { index in
             let x = xPosition(for: index, in: layout)
@@ -188,7 +270,7 @@ public struct UsageLineChart: View {
             }
             .stroke(Color.secondary.opacity(0.40), lineWidth: 1)
 
-            Text(axisLabel(for: buckets[index]))
+            Text(axisDateLabel(at: index))
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -204,9 +286,10 @@ public struct UsageLineChart: View {
     @ViewBuilder
     private func usageLine(in layout: ChartLayout) -> some View {
         if hasActivity && buckets.count > 1 {
-            let samples = UsageChartMath.smoothedSamples(
+            let samples = UsageChartMath.renderSamples(
                 values: buckets.map(\.tokens),
-                positions: positions
+                positions: positions,
+                maximumSampleCount: Self.renderSampleBudget(plotWidth: layout.plotRect.width)
             )
             Path { path in
                 for (index, sample) in samples.enumerated() {
@@ -222,10 +305,75 @@ public struct UsageLineChart: View {
                 }
             }
             .stroke(
-                Color.mint,
+                accentColor,
                 style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
             )
         }
+    }
+
+    static func renderSampleBudget(plotWidth: CGFloat) -> Int {
+        guard plotWidth.isFinite else { return 4_096 }
+        let boundedWidth = min(max(plotWidth, 1), 1_024)
+        return min(max(Int(boundedWidth.rounded(.up)) * 4, 16), 4_096)
+    }
+
+    /// Removes labels whose fixed-width frames would collide at highly clustered
+    /// civil-date positions. The first and last dates remain stable anchors.
+    static func nonoverlappingTickIndices(
+        positions: [Double],
+        maximumTickCount: Int,
+        plotWidth: CGFloat,
+        labelWidth: CGFloat,
+        minimumGap: CGFloat = 4
+    ) -> [Int] {
+        let candidates = UsageChartMath.tickIndices(
+            positions: positions,
+            maximumTickCount: maximumTickCount
+        )
+        guard candidates.count > 2,
+              plotWidth.isFinite,
+              plotWidth > 0,
+              labelWidth.isFinite,
+              labelWidth > 0
+        else { return candidates }
+
+        let lastPointIndex = positions.count - 1
+        let coordinatesAreValid = validPositions(positions, count: positions.count)
+        func coordinate(for index: Int) -> CGFloat {
+            if coordinatesAreValid {
+                return CGFloat(positions[index]) * plotWidth
+            }
+            guard lastPointIndex > 0 else { return plotWidth / 2 }
+            return (CGFloat(index) / CGFloat(lastPointIndex)) * plotWidth
+        }
+        func interval(for index: Int) -> ClosedRange<CGFloat> {
+            let center: CGFloat
+            if index == 0 {
+                center = labelWidth / 2
+            } else if index == lastPointIndex {
+                center = plotWidth - (labelWidth / 2)
+            } else {
+                center = coordinate(for: index)
+            }
+            return (center - (labelWidth / 2))...(center + (labelWidth / 2))
+        }
+
+        guard let first = candidates.first, let last = candidates.last, first != last else {
+            return candidates
+        }
+        let finalInterval = interval(for: last)
+        var result = [first]
+        var previousInterval = interval(for: first)
+        for index in candidates.dropFirst().dropLast() {
+            let candidateInterval = interval(for: index)
+            guard candidateInterval.lowerBound >= previousInterval.upperBound + minimumGap,
+                  candidateInterval.upperBound + minimumGap <= finalInterval.lowerBound
+            else { continue }
+            result.append(index)
+            previousInterval = candidateInterval
+        }
+        result.append(last)
+        return result
     }
 
     @ViewBuilder
@@ -246,7 +394,7 @@ public struct UsageLineChart: View {
             .fill(Color(nsColor: .windowBackgroundColor))
             .frame(width: 10, height: 10)
             .overlay {
-                Circle().stroke(Color.mint, lineWidth: 3)
+                Circle().stroke(accentColor, lineWidth: 3)
             }
             .position(point)
             .allowsHitTesting(false)
@@ -297,8 +445,7 @@ public struct UsageLineChart: View {
             .focused($isFocused)
             .onMoveCommand(perform: moveSelection)
             .onExitCommand {
-                hoveredIndex = nil
-                pinnedIndex = nil
+                resetSelection()
             }
             .position(x: layout.plotRect.midX, y: layout.plotRect.midY)
     }
@@ -324,12 +471,12 @@ public struct UsageLineChart: View {
         ))
 
         VStack(alignment: .leading, spacing: 2) {
-            Text(tooltipDate(for: bucket))
+            Text(tooltipDateLabel(at: index))
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-            Text("\(UsageFormatting.fullTokens(bucket.tokens)) tokens")
+            Text("\(UsageFormatting.fullTokens(bucket.tokens, locale: locale)) tokens")
                 .font(.system(size: 11, weight: .bold, design: .rounded))
                 .foregroundStyle(.primary)
                 .monospacedDigit()
@@ -381,6 +528,13 @@ public struct UsageLineChart: View {
         suppressHoverUntilReentry = false
     }
 
+    private func synchronizeExternalSelection(to newIndex: Int?) {
+        hoveredIndex = nil
+        pinnedIndex = newIndex
+        isHovering = false
+        suppressHoverUntilReentry = false
+    }
+
     private func point(for index: Int, in layout: ChartLayout) -> CGPoint {
         CGPoint(
             x: xPosition(for: index, in: layout),
@@ -405,8 +559,15 @@ public struct UsageLineChart: View {
     }
 
     private func xAxisLabelCenter(for index: Int, x: CGFloat, in layout: ChartLayout) -> CGFloat {
-        guard buckets.count > 1 else { return x }
         let halfWidth: CGFloat = tickLabelWidth / 2
+        guard buckets.count > 1 else {
+            return CGFloat(UsageChartMath.clampedCenter(
+                proposed: Double(x),
+                itemLength: Double(halfWidth * 2),
+                lowerBound: Double(layout.plotRect.minX),
+                upperBound: Double(layout.plotRect.maxX)
+            ))
+        }
         if index == buckets.startIndex {
             return layout.plotRect.minX + halfWidth
         }
@@ -416,12 +577,16 @@ public struct UsageLineChart: View {
         return x
     }
 
-    private func axisLabel(for bucket: DailyUsageBucket) -> String {
-        guard let date = UsageWindows.date(from: bucket.startDate) else { return bucket.startDate }
+    private static func makeAxisDateFormatter(
+        style: UsageChartDateLabelStyle,
+        calendar: Calendar,
+        locale: Locale
+    ) -> DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.timeZone = .current
-        switch axisPolicy.dateLabelStyle {
+        formatter.calendar = calendar
+        formatter.locale = locale
+        formatter.timeZone = calendar.timeZone
+        switch style {
         case .singleLetterWeekday:
             formatter.setLocalizedDateFormatFromTemplate("EEEEE")
         case .abbreviatedWeekday:
@@ -433,25 +598,96 @@ public struct UsageLineChart: View {
         case .abbreviatedMonthYear:
             formatter.setLocalizedDateFormatFromTemplate("MMM yyyy")
         }
-        return formatter.string(from: date)
+        return formatter
     }
 
-    private func tooltipDate(for bucket: DailyUsageBucket) -> String {
-        guard let date = UsageWindows.date(from: bucket.startDate) else { return bucket.startDate }
+    private static func makeTooltipDateFormatter(
+        calendar: Calendar,
+        locale: Locale
+    ) -> DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.timeZone = .current
+        formatter.calendar = calendar
+        formatter.locale = locale
+        formatter.timeZone = calendar.timeZone
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
+        return formatter
+    }
+
+    private func axisDateLabel(at index: Int) -> String {
+        formattedDateLabel(at: index, formatter: axisDateFormatter)
+    }
+
+    private func tooltipDateLabel(at index: Int) -> String {
+        formattedDateLabel(at: index, formatter: tooltipDateFormatter)
+    }
+
+    private func formattedDateLabel(at index: Int, formatter: DateFormatter) -> String {
+        let bucket = buckets[index]
+        guard let date = UsageWindows.date(
+            from: bucket.startDate,
+            timeZone: calendar.timeZone
+        ), Self.foundationCalendar(calendar, represents: bucket.startDate, at: date) else {
+            return Self.safeFallbackDateLabel(bucket.startDate)
+        }
         return formatter.string(from: date)
     }
 
-    private var accessibilityValue: String {
-        guard let activeIndex, buckets.indices.contains(activeIndex) else {
-            return buckets.isEmpty ? "No usage data" : "No point selected"
+    private static func foundationCalendar(
+        _ calendar: Calendar,
+        represents bucketStartDate: String,
+        at date: Date
+    ) -> Bool {
+        // The bucket contract is proleptic Gregorian regardless of the user's
+        // display calendar. Use Gregorian only to detect Foundation's historical
+        // cutover mismatch; the caller's calendar still formats valid modern dates.
+        var validationCalendar = Calendar(identifier: .gregorian)
+        validationCalendar.locale = Locale(identifier: "en_US_POSIX")
+        validationCalendar.timeZone = calendar.timeZone
+        let components = validationCalendar.dateComponents([.year, .month, .day], from: date)
+        guard let year = components.year, let month = components.month, let day = components.day else {
+            return false
         }
-        let bucket = buckets[activeIndex]
-        return "\(tooltipDate(for: bucket)), \(UsageFormatting.fullTokens(bucket.tokens)) tokens"
+        let rendered = String(
+            format: "%04d-%02d-%02d",
+            locale: Locale(identifier: "en_US_POSIX"),
+            year,
+            month,
+            day
+        )
+        return rendered == bucketStartDate
+    }
+
+    private static func safeFallbackDateLabel(_ value: String) -> String {
+        UsageWindows.isCanonicalBucketStartDate(value) ? value : "Invalid date"
+    }
+
+    var accessibilityValue: String {
+        if buckets.isEmpty { return "No activity" }
+        if let activeIndex, buckets.indices.contains(activeIndex) {
+            let bucket = buckets[activeIndex]
+            return "\(tooltipDateLabel(at: activeIndex)), \(UsageFormatting.fullTokens(bucket.tokens, locale: locale)) tokens"
+        }
+        return hasActivity ? "No point selected" : "No activity"
+    }
+}
+
+enum UsageChartAxisLabel {
+    static func text(_ value: Int64) -> String {
+        // Values above the trillion range make localized compact strings wider
+        // than the chart's Y-axis gutter. Scientific notation is unambiguous and
+        // remains bounded even for Int64.max (for example, "9.2e18").
+        if abs(Double(value)) >= 1_000_000_000_000_000 {
+            return String(
+                format: "%.1e",
+                locale: Locale(identifier: "en_US_POSIX"),
+                Double(value)
+            )
+                .lowercased(with: Locale(identifier: "en_US_POSIX"))
+                .replacingOccurrences(of: "e+", with: "e")
+                .replacingOccurrences(of: "e0", with: "e")
+        }
+        return UsageFormatting.axisTokens(value)
     }
 }
 

@@ -5,14 +5,16 @@ import AppKit
 enum UsageMenuBarIcon {
     static let image: NSImage = {
         let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size)
-        image.lockFocus()
-
-        if let cgContext = NSGraphicsContext.current?.cgContext {
+        // A drawing-handler representation is resolution independent. A bitmap
+        // produced once with `lockFocus()` can otherwise be an 18-pixel source
+        // stretched across a 36-pixel Retina menu-bar slot.
+        let image = NSImage(size: size, flipped: false) { _ in
+            guard let cgContext = NSGraphicsContext.current?.cgContext else {
+                return false
+            }
             draw(in: cgContext)
+            return true
         }
-
-        image.unlockFocus()
         image.isTemplate = true
         image.accessibilityDescription = "Codex Usage"
         return image

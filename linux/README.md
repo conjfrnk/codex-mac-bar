@@ -21,7 +21,7 @@ The Linux app is independent of the macOS Swift target in the repository root. I
 Install build dependencies:
 
 ```sh
-sudo pacman -S --needed base-devel rust gtk4 dbus
+sudo pacman -S --needed base-devel rust gtk4 dbus xorg-server-xvfb
 ```
 
 GTK 4.10 or newer is required. The Codex CLI must also be installed and signed in.
@@ -72,7 +72,9 @@ sudo pacman -S gnome-shell-extension-appindicator
 gnome-extensions enable $(gnome-extensions list | grep -m1 appindicatorsupport)
 ```
 
-The main window remains available from the desktop launcher even if the current panel does not provide a tray host. A left click on the tray icon opens the window, a second left click or Escape dismisses it, a middle click refreshes it, and the context menu provides timeframe, refresh, autostart, and quit actions. The window deliberately remains open when pointer-driven focus moves elsewhere, which keeps it usable on focus-follows-mouse Wayland compositors.
+The main window remains available from the desktop launcher even if the current panel does not provide a tray host. A left click on the tray icon opens the window, a second left click or Escape dismisses it, a middle click refreshes it, and the context menu provides timeframe, refresh, autostart, and quit actions. When the chart has keyboard focus, the first Escape clears its pinned point; a subsequent Escape dismisses the window. The window deliberately remains open when pointer-driven focus moves elsewhere, which keeps it usable on focus-follows-mouse Wayland compositors.
+
+If a refresh fails after valid data has loaded, the app keeps that snapshot visible and marks it stale instead of replacing it with an empty error screen. Relative refresh and rate-limit labels update while the popover is open, and an unexpected wall-clock change forces a fresh fetch.
 
 The tray pixmap itself contains both the gauge and the current compact total, so
 Waybar and other panels that preserve a StatusNotifierItem's aspect ratio show the
@@ -98,7 +100,7 @@ codex-usage-bar --check         # test app-server access without GTK/display
 codex-usage-bar --waybar        # one JSON status update for Waybar
 ```
 
-Preferences are stored in `${XDG_CONFIG_HOME:-~/.config}/codex-usage-bar/config.json`. Enabling “Open at login” creates `${XDG_CONFIG_HOME:-~/.config}/autostart/io.github.conjfrnk.CodexUsageBar.desktop` using the installed executable's absolute path.
+Preferences are stored in `${XDG_CONFIG_HOME:-~/.config}/codex-usage-bar/config.json`. Enabling “Open at login” creates `${XDG_CONFIG_HOME:-~/.config}/autostart/io.github.conjfrnk.CodexUsageBar.desktop` using the installed executable's absolute path. If neither `XDG_CONFIG_HOME` nor `HOME` identifies an absolute directory, the app safely leaves persistence and autostart unavailable instead of reading or writing a working-directory-relative `.config`.
 
 The app starts `codex app-server --stdio` for each refresh. That interface is experimental and may change between Codex CLI versions. If auto-discovery fails:
 
@@ -116,5 +118,17 @@ cargo fmt --check
 
 `make check` treats Clippy warnings as errors. The tray service talks to the session D-Bus; the pure calculation and decoding tests do not require a graphical session.
 `make visual-test` mirrors the macOS visual-check workflow by rendering opaque light,
-dark, narrow, full-content, and live-size parity fixtures under
-`target/parity-snapshots/` without reading account data.
+dark, narrow, tall, live-size, every timeframe, loading, stale, error, maximum-token, and
+long-unbroken-diagnostic parity fixtures under
+`target/parity-snapshots/` without reading account data. The fixture clock and dates
+are fixed; the target uses an explicit 2560×2160 Xvfb display so the compositor cannot
+cap and stretch tall fixtures. It also exercises the accepted 220-pixel minimum,
+the former 288/289-pixel chart boundary, 559/560-pixel viewport boundary, and the
+2,000-pixel maximum width and height (both separately and together). The check renders one case with autostart both absent and
+present in isolated configuration homes and requires byte-identical PNGs, then validates
+opacity and exact allocation dimensions. Its semantic oracle
+scrolls each expected header, state message, tabs, summary, chart, history, rate-limit,
+and action widget into view and verifies distinct allocation order and visible pixels.
+The header logo, title, and value have separate non-overlapping ink probes, and error
+fixtures reject an initially focused/preselected selectable diagnostic; one visible
+element therefore cannot accidentally satisfy an adjacent semantic check.

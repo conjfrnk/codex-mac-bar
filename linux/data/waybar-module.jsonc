@@ -3,6 +3,7 @@
 "custom/codex-usage": {
     "exec": "codex-usage-bar --waybar",
     "return-type": "json",
+    "escape": true,
     "interval": 300,
     "format": "{}",
     "on-click": "codex-usage-bar --no-tray",

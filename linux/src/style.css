@@ -7,7 +7,7 @@ window.codex-window .content {
 }
 
 window.codex-window {
-  border: 1px solid alpha(@theme_fg_color, 0.24);
+  box-shadow: inset 0 0 0 1px alpha(@theme_fg_color, 0.24);
 }
 
 window.codex-window.codex-light,
@@ -27,11 +27,11 @@ window.codex-window.codex-dark .content {
 }
 
 window.codex-window.codex-light {
-  border-color: #b9bbc1;
+  box-shadow: inset 0 0 0 1px #b9bbc1;
 }
 
 window.codex-window.codex-dark {
-  border-color: #5a5a5d;
+  box-shadow: inset 0 0 0 1px #5a5a5d;
 }
 
 .content {
@@ -86,13 +86,35 @@ window.codex-window.codex-dark {
 .error-message {
   font-size: 14px;
   font-weight: 600;
-  opacity: 0.68;
+}
+
+.warning-message {
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+window.codex-window.codex-light .error-message {
+  color: #9b1c1c;
+}
+
+window.codex-window.codex-dark .error-message {
+  color: #ffb4ab;
+}
+
+window.codex-window.codex-light .warning-message,
+window.codex-window.codex-light .status-note {
+  color: #704600;
+}
+
+window.codex-window.codex-dark .warning-message,
+window.codex-window.codex-dark .status-note {
+  color: #ffd479;
 }
 
 .status-note {
   margin: 4px 0 4px 28px;
   font-size: 12px;
-  opacity: 0.68;
 }
 
 .timeframe button {
@@ -112,6 +134,35 @@ window.codex-window.codex-dark {
 .timeframe button.selected {
   background-color: alpha(@theme_fg_color, 0.10);
   opacity: 1;
+}
+
+window.codex-window.codex-light .timeframe button.selected {
+  background-color: rgba(32, 33, 36, 0.12);
+}
+
+window.codex-window.codex-dark .timeframe button.selected {
+  background-color: rgba(241, 241, 243, 0.16);
+}
+
+.timeframe button:focus-visible,
+.chart:focus-visible,
+.pager-button:focus-visible,
+.action-row:focus-visible,
+.action-check:focus-visible {
+  outline: 2px solid #3584e4;
+  outline-offset: 1px;
+}
+
+.chart:focus-visible {
+  outline-offset: -2px;
+}
+
+window.codex-window.codex-system .timeframe button:focus-visible,
+window.codex-window.codex-system .chart:focus-visible,
+window.codex-window.codex-system .pager-button:focus-visible,
+window.codex-window.codex-system .action-row:focus-visible,
+window.codex-window.codex-system .action-check:focus-visible {
+  outline-color: @theme_fg_color;
 }
 
 .divider {
@@ -169,8 +220,13 @@ progressbar.error progress {
   background-color: #df3b35;
 }
 
+window.codex-window.codex-system progressbar progress {
+  background-color: @theme_fg_color;
+}
+
 progressbar trough,
 progressbar progress {
+  min-width: 0;
   min-height: 4px;
   border-radius: 2px;
 }
@@ -187,4 +243,14 @@ progressbar progress {
   padding: 2px 8px;
   font-size: 16px;
   font-weight: 600;
+}
+
+window.codex-window.codex-system .section-title,
+window.codex-window.codex-system .stat-label,
+window.codex-window.codex-system .muted,
+window.codex-window.codex-system .footer,
+window.codex-window.codex-system .limit-reset,
+window.codex-window.codex-system .timeframe button,
+window.codex-window.codex-system .divider {
+  opacity: 1;
 }

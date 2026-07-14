@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, NaiveDate};
 use gtk::cairo;
 use gtk::gdk;
 use gtk::glib::Propagation;
@@ -11,6 +11,9 @@ use crate::model::DailyUsageBucket;
 use crate::range::{Timeframe, format_axis_tokens, format_full_tokens, nice_axis_maximum};
 
 const MINT: (f64, f64, f64) = (0.29, 0.87, 0.75);
+const LIGHT_BACKGROUND_MINT: (f64, f64, f64) = (0.03, 0.45, 0.37);
+const MAXIMUM_DRAW_POINTS: usize = 4_096;
+const DRAW_POINTS_PER_PIXEL: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DateLabelStyle {
@@ -101,10 +104,17 @@ impl Selection {
         self.hovered.or(self.pinned)
     }
 
-    fn reset(&mut self) {
-        self.hovered = None;
-        self.pinned = None;
-        self.suppress_hover_until_reentry = false;
+    fn clear_for_escape(&mut self) -> bool {
+        let had_selection = self.active().is_some();
+        if had_selection {
+            self.hovered = None;
+            self.pinned = None;
+            // Pointer motion can arrive between two Escape presses. Keep hover
+            // disabled until a real leave/re-enter cycle so that the second
+            // Escape reliably bubbles to the window and dismisses it.
+            self.suppress_hover_until_reentry = true;
+        }
+        had_selection
     }
 }
 
@@ -114,34 +124,78 @@ struct ChartSample {
     value: f64,
 }
 
-pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::DrawingArea {
+struct PreparedChart {
+    positions: Vec<f64>,
+    peak: i64,
+    plot_values: Vec<i64>,
+    plot_positions: Vec<f64>,
+}
+
+impl PreparedChart {
+    fn new(buckets: &[DailyUsageBucket]) -> Self {
+        let positions = bucket_positions(buckets);
+        let values: Vec<_> = buckets.iter().map(chart_token_value).collect();
+        let peak = values.iter().copied().max().unwrap_or(0);
+        let (plot_values, plot_positions) =
+            bounded_plot_series(&values, &positions, MAXIMUM_DRAW_POINTS);
+        Self {
+            positions,
+            peak,
+            plot_values,
+            plot_positions,
+        }
+    }
+}
+
+pub fn usage_chart(
+    buckets: &[DailyUsageBucket],
+    timeframe: Timeframe,
+    data_available: bool,
+) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_height(150);
     area.set_hexpand(true);
     area.add_css_class("chart");
-    area.set_focusable(true);
-    area.set_focus_on_click(true);
-    area.set_accessible_role(gtk::AccessibleRole::Slider);
-    area.set_tooltip_text(Some(
-        "Daily token usage chart; move, click, or use arrow keys to inspect a day",
-    ));
-
-    let buckets = Rc::new(buckets.to_vec());
+    let buckets = if data_available {
+        buckets.to_vec()
+    } else {
+        Vec::new()
+    };
+    let adjustable = !buckets.is_empty();
+    area.set_focusable(adjustable);
+    area.set_focus_on_click(adjustable);
+    area.set_accessible_role(if adjustable {
+        gtk::AccessibleRole::Slider
+    } else {
+        gtk::AccessibleRole::Img
+    });
+    let buckets = Rc::new(buckets);
+    // Parsing calendar dates for every pointer event made an all-time chart do
+    // O(n) work per mouse movement. Positions are immutable for the widget.
+    let prepared = Rc::new(PreparedChart::new(&buckets));
     let selection = Rc::new(RefCell::new(Selection::default()));
-    update_chart_accessibility(&area, &buckets, None);
+    update_chart_accessibility(&area, &buckets, None, data_available);
     let draw_buckets = buckets.clone();
+    let draw_prepared = prepared.clone();
     let draw_selection = selection.clone();
     area.set_draw_func(move |area, context, width, height| {
-        draw_chart(
-            area,
+        draw_prepared_chart(
             context,
             width,
             height,
             &draw_buckets,
+            &draw_prepared,
             timeframe,
             draw_selection.borrow().active(),
+            area.color(),
+            data_available,
+            widget_uses_high_contrast(area),
         );
     });
+
+    if !adjustable {
+        return area;
+    }
 
     let motion = gtk::EventControllerMotion::new();
     let enter_selection = selection.clone();
@@ -149,6 +203,7 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
         enter_selection.borrow_mut().suppress_hover_until_reentry = false;
     });
     let motion_buckets = buckets.clone();
+    let motion_prepared = prepared.clone();
     let leave_buckets = buckets.clone();
     let motion_selection = selection.clone();
     let weak_area = area.downgrade();
@@ -157,8 +212,9 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
             return;
         };
         let layout = ChartLayout::new(f64::from(area.width()), f64::from(area.height()));
-        let active = {
+        let (active, changed) = {
             let mut selection = motion_selection.borrow_mut();
+            let previous = selection.active();
             if !selection.suppress_hover_until_reentry
                 && x >= layout.left
                 && x <= layout.right
@@ -166,25 +222,32 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
                 && y <= layout.bottom
             {
                 let position = (x - layout.left) / layout.width();
-                selection.hovered = nearest_index(position, &bucket_positions(&motion_buckets));
+                selection.hovered =
+                    nearest_index_in_valid_positions(position, &motion_prepared.positions);
             } else if !selection.suppress_hover_until_reentry {
                 selection.hovered = None;
             }
-            selection.active()
+            let active = selection.active();
+            (active, active != previous)
         };
-        update_chart_accessibility(&area, &motion_buckets, active);
+        if !changed {
+            return;
+        }
+        update_chart_accessibility(&area, &motion_buckets, active, data_available);
         area.queue_draw();
     });
     let leave_selection = selection.clone();
     let weak_area = area.downgrade();
     motion.connect_leave(move |_| {
-        let active = {
+        let (active, changed) = {
             let mut selection = leave_selection.borrow_mut();
+            let previous = selection.active();
             selection.hovered = None;
-            selection.active()
+            let active = selection.active();
+            (active, active != previous)
         };
-        if let Some(area) = weak_area.upgrade() {
-            update_chart_accessibility(&area, &leave_buckets, active);
+        if changed && let Some(area) = weak_area.upgrade() {
+            update_chart_accessibility(&area, &leave_buckets, active, data_available);
             area.queue_draw();
         }
     });
@@ -193,6 +256,7 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
     let click = gtk::GestureClick::new();
     click.set_button(gdk::BUTTON_PRIMARY);
     let click_buckets = buckets.clone();
+    let click_prepared = prepared;
     let click_selection = selection.clone();
     let weak_area = area.downgrade();
     click.connect_released(move |_, _, x, y| {
@@ -203,9 +267,9 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
         if x < layout.left || x > layout.right || y < layout.top || y > layout.bottom {
             return;
         }
-        let index = nearest_index(
+        let index = nearest_index_in_valid_positions(
             (x - layout.left) / layout.width(),
-            &bucket_positions(&click_buckets),
+            &click_prepared.positions,
         );
         let mut selection = click_selection.borrow_mut();
         selection.pinned = index;
@@ -213,7 +277,7 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
         selection.suppress_hover_until_reentry = false;
         drop(selection);
         area.grab_focus();
-        update_chart_accessibility(&area, &click_buckets, index);
+        update_chart_accessibility(&area, &click_buckets, index, data_available);
         area.queue_draw();
     });
     area.add_controller(click);
@@ -227,8 +291,13 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
             return Propagation::Proceed;
         };
         if key == gdk::Key::Escape {
-            key_selection.borrow_mut().reset();
-            update_chart_accessibility(&area, &key_buckets, None);
+            // The first Escape clears an active chart inspection. Once there
+            // is nothing left to clear, let the window's bubble controller
+            // dismiss the popover instead of trapping Escape forever.
+            if !key_selection.borrow_mut().clear_for_escape() {
+                return Propagation::Proceed;
+            }
+            update_chart_accessibility(&area, &key_buckets, None, data_available);
             area.queue_draw();
             return Propagation::Stop;
         }
@@ -253,7 +322,7 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
         selection.pinned = Some(next);
         selection.suppress_hover_until_reentry = true;
         drop(selection);
-        update_chart_accessibility(&area, &key_buckets, Some(next));
+        update_chart_accessibility(&area, &key_buckets, Some(next), data_available);
         area.queue_draw();
         Propagation::Stop
     });
@@ -261,26 +330,56 @@ pub fn usage_chart(buckets: &[DailyUsageBucket], timeframe: Timeframe) -> gtk::D
     area
 }
 
+fn widget_uses_high_contrast(widget: &impl IsA<gtk::Widget>) -> bool {
+    let mut current = Some(widget.as_ref().clone());
+    while let Some(widget) = current {
+        if widget.has_css_class("codex-system") {
+            return true;
+        }
+        current = widget.parent();
+    }
+    false
+}
+
 fn update_chart_accessibility(
     area: &gtk::DrawingArea,
     buckets: &[DailyUsageBucket],
     selected: Option<usize>,
+    data_available: bool,
 ) {
     let value = if let Some(index) = selected.filter(|index| *index < buckets.len()) {
         let bucket = &buckets[index];
         format!(
             "{}, {} tokens",
             tooltip_date(&bucket.start_date),
-            format_full_tokens(bucket.tokens)
+            format_full_tokens(chart_token_value(bucket))
         )
+    } else if !data_available {
+        "Usage history unavailable".into()
     } else if buckets.is_empty() {
-        "No usage data".into()
+        "No activity".into()
     } else {
-        "No point selected".into()
+        let bucket = &buckets[buckets.len() - 1];
+        format!(
+            "Most recent: {}, {} tokens",
+            tooltip_date(&bucket.start_date),
+            format_full_tokens(chart_token_value(bucket))
+        )
     };
+    if buckets.is_empty() {
+        area.update_property(&[
+            gtk::accessible::Property::Label("Daily token usage chart"),
+            gtk::accessible::Property::Description(if data_available {
+                "No daily activity is available for this timeframe."
+            } else {
+                "Daily usage history is unavailable or could not be represented safely."
+            }),
+        ]);
+        return;
+    }
     let maximum = buckets.len().saturating_sub(1) as f64;
     let current = selected
-        .unwrap_or_else(|| buckets.len().saturating_sub(1))
+        .unwrap_or(buckets.len().saturating_sub(1))
         .min(buckets.len().saturating_sub(1)) as f64;
     area.update_property(&[
         gtk::accessible::Property::Label("Daily token usage chart"),
@@ -295,26 +394,7 @@ fn update_chart_accessibility(
     ]);
 }
 
-fn draw_chart(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
-    width: i32,
-    height: i32,
-    buckets: &[DailyUsageBucket],
-    timeframe: Timeframe,
-    selected: Option<usize>,
-) {
-    draw_chart_with_foreground(
-        context,
-        width,
-        height,
-        buckets,
-        timeframe,
-        selected,
-        area.color(),
-    );
-}
-
+#[cfg(test)]
 fn draw_chart_with_foreground(
     context: &cairo::Context,
     width: i32,
@@ -324,26 +404,52 @@ fn draw_chart_with_foreground(
     selected: Option<usize>,
     foreground: gdk::RGBA,
 ) {
+    let prepared = PreparedChart::new(buckets);
+    draw_prepared_chart(
+        context, width, height, buckets, &prepared, timeframe, selected, foreground, true, false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_prepared_chart(
+    context: &cairo::Context,
+    width: i32,
+    height: i32,
+    buckets: &[DailyUsageBucket],
+    prepared: &PreparedChart,
+    timeframe: Timeframe,
+    selected: Option<usize>,
+    foreground: gdk::RGBA,
+    data_available: bool,
+    high_contrast: bool,
+) {
     let layout = ChartLayout::new(f64::from(width), f64::from(height));
-    let positions = bucket_positions(buckets);
-    let peak = buckets
-        .iter()
-        .map(|bucket| bucket.tokens)
-        .max()
-        .unwrap_or(0);
+    let positions = &prepared.positions;
+    let peak = prepared.peak;
     let axis_max = nice_axis_maximum(peak);
     let span_days = bucket_span_days(buckets);
     let policy = AxisPolicy::for_timeframe(timeframe, span_days);
 
     draw_axes(
-        context, layout, buckets, &positions, timeframe, policy, axis_max, foreground,
+        context, layout, buckets, positions, timeframe, policy, axis_max, foreground,
     );
 
-    let has_activity = peak > 0 && buckets.iter().any(|bucket| bucket.tokens > 0);
+    let has_activity = data_available && peak > 0;
+    let accent = chart_accent(foreground, high_contrast);
     if has_activity && buckets.len() > 1 {
-        let values: Vec<_> = buckets.iter().map(|bucket| bucket.tokens).collect();
-        let samples = smoothed_samples(&values, &positions, 12);
-        context.set_source_rgb(MINT.0, MINT.1, MINT.2);
+        let maximum_points = (width.max(1) as usize)
+            .saturating_mul(DRAW_POINTS_PER_PIXEL)
+            .clamp(2, MAXIMUM_DRAW_POINTS);
+        let (plot_values, plot_positions) = bounded_plot_series(
+            &prepared.plot_values,
+            &prepared.plot_positions,
+            maximum_points,
+        );
+        let segment_count = plot_values.len().saturating_sub(1).max(1);
+        let samples_per_segment =
+            ((width.max(1) as usize).saturating_mul(2) / segment_count).clamp(1, 12);
+        let samples = smoothed_samples(&plot_values, &plot_positions, samples_per_segment);
+        context.set_source_rgb(accent.0, accent.1, accent.2);
         context.set_line_width(2.5);
         context.set_line_cap(cairo::LineCap::Round);
         context.set_line_join(cairo::LineJoin::Round);
@@ -358,26 +464,39 @@ fn draw_chart_with_foreground(
         }
         let _ = context.stroke();
     } else if has_activity && buckets.len() == 1 {
-        let (x, y) = point_for(0, buckets, &positions, layout, axis_max);
-        context.set_source_rgb(MINT.0, MINT.1, MINT.2);
+        let (x, y) = point_for(0, buckets, positions, layout, axis_max);
+        context.set_source_rgb(accent.0, accent.1, accent.2);
         context.arc(x, y, 3.5, 0.0, std::f64::consts::TAU);
         let _ = context.fill();
     } else {
         context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
         context.set_font_size(12.0);
         set_rgba(context, foreground, 0.64);
-        draw_centered_text(context, "No activity", layout.mid_x(), layout.mid_y());
+        draw_centered_text(
+            context,
+            if data_available {
+                "No activity"
+            } else {
+                "Usage unavailable"
+            },
+            layout.mid_x(),
+            layout.mid_y(),
+        );
     }
 
     if let Some(index) = selected.filter(|index| *index < buckets.len()) {
         draw_selection(
-            context, layout, buckets, &positions, axis_max, index, foreground,
+            context,
+            layout,
+            point_for(index, buckets, positions, layout, axis_max),
+            foreground,
+            accent,
         );
         draw_tooltip(
             context,
             layout,
             &buckets[index],
-            point_for(index, buckets, &positions, layout, axis_max),
+            point_for(index, buckets, positions, layout, axis_max),
             foreground,
         );
     }
@@ -435,7 +554,9 @@ fn draw_axes(
     } else {
         56.0
     };
-    for index in tick_indices(positions, policy.maximum_tick_count) {
+    // Prepared positions are validated once when they are built; avoid an
+    // O(n) validation scan on every hover-triggered redraw.
+    for index in tick_indices_in_valid_positions(positions, policy.maximum_tick_count) {
         let x = layout.left + positions[index] * layout.width();
         set_rgba(context, foreground, 0.40);
         context.move_to(x, layout.bottom);
@@ -470,13 +591,11 @@ fn draw_axes(
 fn draw_selection(
     context: &cairo::Context,
     layout: ChartLayout,
-    buckets: &[DailyUsageBucket],
-    positions: &[f64],
-    axis_max: i64,
-    index: usize,
+    point: (f64, f64),
     foreground: gdk::RGBA,
+    accent: (f64, f64, f64),
 ) {
-    let (x, y) = point_for(index, buckets, positions, layout, axis_max);
+    let (x, y) = point;
     set_rgba(context, foreground, 0.45);
     context.set_line_width(1.0);
     context.set_dash(&[3.0, 3.0], 0.0);
@@ -493,7 +612,7 @@ fn draw_selection(
     }
     context.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
     let _ = context.fill_preserve();
-    context.set_source_rgb(MINT.0, MINT.1, MINT.2);
+    context.set_source_rgb(accent.0, accent.1, accent.2);
     context.set_line_width(3.0);
     let _ = context.stroke();
 }
@@ -548,7 +667,7 @@ fn draw_tooltip(
     set_rgba(context, foreground, 1.0);
     draw_fitted_text(
         context,
-        &format!("{} tokens", format_full_tokens(bucket.tokens)),
+        &format!("{} tokens", format_full_tokens(chart_token_value(bucket))),
         x + 8.0,
         y + 34.0,
         tooltip_width - 16.0,
@@ -567,8 +686,12 @@ fn point_for(
 ) -> (f64, f64) {
     (
         layout.left + positions[index] * layout.width(),
-        y_position(buckets[index].tokens as f64, layout, axis_max),
+        y_position(chart_token_value(&buckets[index]) as f64, layout, axis_max),
     )
+}
+
+fn chart_token_value(bucket: &DailyUsageBucket) -> i64 {
+    bucket.tokens.max(0)
 }
 
 fn y_position(value: f64, layout: ChartLayout, axis_max: i64) -> f64 {
@@ -583,6 +706,24 @@ fn set_rgba(context: &cairo::Context, color: gdk::RGBA, alpha: f64) {
         f64::from(color.blue()),
         alpha,
     );
+}
+
+fn chart_accent(foreground: gdk::RGBA, high_contrast: bool) -> (f64, f64, f64) {
+    if high_contrast {
+        return (
+            f64::from(foreground.red()),
+            f64::from(foreground.green()),
+            f64::from(foreground.blue()),
+        );
+    }
+    // A dark foreground means a light canvas. The brighter macOS mint is
+    // excellent on dark backgrounds but too faint against white, so use its
+    // darker companion there to keep the data line distinguishable.
+    if foreground.red() < 0.5 {
+        LIGHT_BACKGROUND_MINT
+    } else {
+        MINT
+    }
 }
 
 fn draw_right_aligned_text(context: &cairo::Context, text: &str, right: f64, baseline: f64) {
@@ -688,23 +829,18 @@ fn bucket_positions(buckets: &[DailyUsageBucket]) -> Vec<f64> {
             vec![0.5]
         };
     }
-    let timestamps: Option<Vec<i64>> = buckets
+    // Calendar dates represent calendar buckets. Unix-midnight distances make
+    // days around DST transitions 23 or 25 hours wide and visibly skew ticks.
+    let dates: Option<Vec<NaiveDate>> = buckets
         .iter()
-        .map(|bucket| {
-            let date = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok()?;
-            let midnight = date.and_hms_opt(0, 0, 0)?;
-            Local
-                .from_local_datetime(&midnight)
-                .earliest()
-                .map(|date| date.timestamp_millis())
-        })
+        .map(|bucket| NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok())
         .collect();
-    if let Some(timestamps) = timestamps {
-        let span = timestamps[timestamps.len() - 1] - timestamps[0];
-        if span > 0 {
-            return timestamps
+    if let Some(dates) = dates {
+        let span = (dates[dates.len() - 1] - dates[0]).num_days();
+        if span > 0 && dates.windows(2).all(|window| window[1] > window[0]) {
+            return dates
                 .iter()
-                .map(|timestamp| (*timestamp - timestamps[0]) as f64 / span as f64)
+                .map(|date| (*date - dates[0]).num_days() as f64 / span as f64)
                 .collect();
         }
     }
@@ -728,16 +864,95 @@ fn evenly_spaced_positions(count: usize) -> Vec<f64> {
 }
 
 fn valid_positions(positions: &[f64], count: usize) -> bool {
-    positions.len() == count
-        && positions.iter().all(|position| position.is_finite())
-        && positions.first().is_some_and(|position| *position >= 0.0)
-        && positions.last().is_some_and(|position| *position <= 1.0)
+    if positions.len() != count || positions.is_empty() {
+        return count == 0 && positions.is_empty();
+    }
+    if count == 1 {
+        return positions[0].is_finite() && (0.0..=1.0).contains(&positions[0]);
+    }
+    positions.iter().all(|position| position.is_finite())
+        && positions
+            .first()
+            .is_some_and(|position| position.abs() <= f64::EPSILON)
+        && positions
+            .last()
+            .is_some_and(|position| (*position - 1.0).abs() <= f64::EPSILON)
         && positions.windows(2).all(|window| {
             let interval = window[1] - window[0];
             interval.is_finite() && interval >= 1e-12
         })
 }
 
+fn bounded_plot_series(
+    values: &[i64],
+    positions: &[f64],
+    maximum_points: usize,
+) -> (Vec<i64>, Vec<f64>) {
+    if values.len() != positions.len() {
+        return (values.to_vec(), evenly_spaced_positions(values.len()));
+    }
+    if values.len() <= maximum_points || values.len() <= 2 {
+        return (values.to_vec(), positions.to_vec());
+    }
+    let maximum_points = maximum_points.max(2);
+    if maximum_points == 2 {
+        return (
+            vec![values[0], values[values.len() - 1]],
+            vec![positions[0], positions[positions.len() - 1]],
+        );
+    }
+    if maximum_points == 3 {
+        let last = values.len() - 1;
+        let peak = (1..last).max_by_key(|index| values[*index]).unwrap_or(0);
+        let mut indices = vec![0, peak, last];
+        indices.sort_unstable();
+        indices.dedup();
+        return (
+            indices.iter().map(|index| values[*index]).collect(),
+            indices.iter().map(|index| positions[*index]).collect(),
+        );
+    }
+    let last = values.len() - 1;
+    let interior_count = last - 1;
+    let bin_count = ((maximum_points - 2) / 2).max(1);
+    let mut indices = Vec::with_capacity(maximum_points);
+    indices.push(0);
+    for bin in 0..bin_count {
+        let start = 1 + interior_count * bin / bin_count;
+        let end = 1 + interior_count * (bin + 1) / bin_count;
+        if start >= end {
+            continue;
+        }
+        let mut minimum = start;
+        let mut maximum = start;
+        for index in start + 1..end {
+            if values[index] < values[minimum] {
+                minimum = index;
+            }
+            if values[index] > values[maximum] {
+                maximum = index;
+            }
+        }
+        if minimum <= maximum {
+            indices.push(minimum);
+            if maximum != minimum {
+                indices.push(maximum);
+            }
+        } else {
+            indices.push(maximum);
+            indices.push(minimum);
+        }
+    }
+    indices.push(last);
+    indices.sort_unstable();
+    indices.dedup();
+    (
+        indices.iter().map(|index| values[*index]).collect(),
+        indices.iter().map(|index| positions[*index]).collect(),
+    )
+}
+
+#[cfg(test)]
 fn nearest_index(position: f64, positions: &[f64]) -> Option<usize> {
     if !position.is_finite() || positions.is_empty() {
         return None;
@@ -749,6 +964,13 @@ fn nearest_index(position: f64, positions: &[f64]) -> Option<usize> {
         fallback = evenly_spaced_positions(positions.len());
         &fallback
     };
+    nearest_index_in_valid_positions(position, positions)
+}
+
+fn nearest_index_in_valid_positions(position: f64, positions: &[f64]) -> Option<usize> {
+    if !position.is_finite() || positions.is_empty() {
+        return None;
+    }
     if positions.len() == 1 || position <= positions[0] {
         return Some(0);
     }
@@ -774,6 +996,7 @@ fn nearest_index(position: f64, positions: &[f64]) -> Option<usize> {
     )
 }
 
+#[cfg(test)]
 fn tick_indices(positions: &[f64], maximum: usize) -> Vec<usize> {
     let count = positions.len();
     if count == 0 || maximum == 0 {
@@ -792,11 +1015,25 @@ fn tick_indices(positions: &[f64], maximum: usize) -> Vec<usize> {
         fallback = evenly_spaced_positions(count);
         &fallback
     };
+    tick_indices_in_valid_positions(positions, maximum)
+}
+
+fn tick_indices_in_valid_positions(positions: &[f64], maximum: usize) -> Vec<usize> {
+    let count = positions.len();
+    if count == 0 || maximum == 0 {
+        return Vec::new();
+    }
+    if count == 1 || maximum == 1 {
+        return vec![0];
+    }
+    if count <= maximum {
+        return (0..count).collect();
+    }
     let mut result = Vec::new();
     for tick in 0..maximum {
         let fraction = tick as f64 / (maximum - 1) as f64;
         let position = positions[0] + fraction * (positions[count - 1] - positions[0]);
-        if let Some(index) = nearest_index(position, positions)
+        if let Some(index) = nearest_index_in_valid_positions(position, positions)
             && result.last().copied() != Some(index)
         {
             result.push(index);
@@ -916,7 +1153,7 @@ fn clamped_center(proposed: f64, item_length: f64, lower: f64, upper: f64) -> f6
 
 fn chart_date_label(value: &str, _timeframe: Timeframe, policy: AxisPolicy) -> String {
     let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
-        return value.into();
+        return "Invalid date".into();
     };
     match policy.date_label_style {
         DateLabelStyle::SingleLetterWeekday => date
@@ -935,7 +1172,7 @@ fn chart_date_label(value: &str, _timeframe: Timeframe, policy: AxisPolicy) -> S
 fn tooltip_date(value: &str) -> String {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map(|date| date.format("%b %-d, %Y").to_string())
-        .unwrap_or_else(|_| value.into())
+        .unwrap_or_else(|_| "Invalid date".into())
 }
 
 #[cfg(test)]
@@ -1002,6 +1239,27 @@ mod tests {
     }
 
     #[test]
+    fn chart_positions_use_calendar_days_and_require_real_endpoints() {
+        let buckets = vec![
+            bucket("2026-03-07", 1),
+            bucket("2026-03-08", 2),
+            bucket("2026-03-09", 3),
+        ];
+        assert_eq!(bucket_positions(&buckets), vec![0.0, 0.5, 1.0]);
+        assert!(valid_positions(&[0.0, 0.5, 1.0], 3));
+        assert!(!valid_positions(&[0.1, 0.5, 1.0], 3));
+        assert!(!valid_positions(&[0.0, 0.5, 0.9], 3));
+        assert_eq!(
+            bucket_positions(&[
+                bucket("2026-03-08", 1),
+                bucket("2026-03-07", 2),
+                bucket("2026-03-09", 3),
+            ]),
+            vec![0.0, 0.5, 1.0]
+        );
+    }
+
+    #[test]
     fn ticks_are_chosen_by_date_position() {
         let positions = vec![0.0, 0.01, 0.49, 0.51, 0.99, 1.0];
         assert_eq!(tick_indices(&positions, 3), vec![0, 3, 5]);
@@ -1055,6 +1313,44 @@ mod tests {
                 .iter()
                 .all(|sample| sample.value == 0.0)
         );
+    }
+
+    #[test]
+    fn plot_bounding_preserves_endpoints_and_each_bins_extrema() {
+        let values: Vec<_> = (0..20_000)
+            .map(|index| {
+                if index == 12_345 {
+                    i64::MAX
+                } else {
+                    (index % 97) as i64
+                }
+            })
+            .collect();
+        let positions = evenly_spaced_positions(values.len());
+        let (bounded_values, bounded_positions) = bounded_plot_series(&values, &positions, 792);
+        assert!(bounded_values.len() <= 792);
+        assert_eq!(bounded_values.first(), values.first());
+        assert_eq!(bounded_values.last(), values.last());
+        assert!(bounded_values.contains(&i64::MAX));
+        assert_eq!(bounded_values.len(), bounded_positions.len());
+        assert!(valid_positions(&bounded_positions, bounded_positions.len()));
+
+        let (three_values, three_positions) = bounded_plot_series(&values, &positions, 3);
+        assert_eq!(three_values.len(), 3);
+        assert_eq!(three_values[1], i64::MAX);
+        assert!(valid_positions(&three_positions, three_positions.len()));
+    }
+
+    #[test]
+    fn escape_is_only_consumed_when_a_chart_selection_was_cleared() {
+        let mut selection = Selection::default();
+        assert!(!selection.clear_for_escape());
+        selection.pinned = Some(2);
+        selection.suppress_hover_until_reentry = true;
+        assert!(selection.clear_for_escape());
+        assert_eq!(selection.active(), None);
+        assert!(selection.suppress_hover_until_reentry);
+        assert!(!selection.clear_for_escape());
     }
 
     #[test]
@@ -1151,6 +1447,34 @@ mod tests {
         assert_eq!(clamped_center(50.0, 40.0, 0.0, 100.0), 50.0);
         assert_eq!(clamped_center(50.0, 400.0, 0.0, 100.0), 50.0);
         assert!(clamped_center(0.0, 1.0, f64::NAN, 10.0).is_finite());
+    }
+
+    #[test]
+    fn high_contrast_chart_uses_the_dynamic_theme_foreground() {
+        let foreground = gdk::RGBA::new(0.13, 0.57, 0.91, 1.0);
+        assert_eq!(
+            chart_accent(foreground, true),
+            (0.13_f32.into(), 0.57_f32.into(), 0.91_f32.into())
+        );
+        assert_ne!(
+            chart_accent(foreground, false),
+            chart_accent(foreground, true)
+        );
+        assert!(
+            !include_str!("chart.rs").contains(concat!("set_tooltip_", "text")),
+            "the drawn chart tooltip must not be duplicated by a GTK tooltip"
+        );
+    }
+
+    #[test]
+    fn invalid_dates_and_negative_direct_fixture_values_are_not_exposed() {
+        let policy = AxisPolicy::for_timeframe(Timeframe::Thirty, None);
+        assert_eq!(
+            chart_date_label("\nspoofed", Timeframe::Thirty, policy),
+            "Invalid date"
+        );
+        assert_eq!(tooltip_date("\u{202e}spoofed"), "Invalid date");
+        assert_eq!(chart_token_value(&bucket("2026-01-01", -42)), 0);
     }
 
     #[test]
