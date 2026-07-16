@@ -28,14 +28,43 @@ test:
 		developer_dir="$$(xcode-select -p)"; \
 		export DEVELOPER_DIR="$$developer_dir"; \
 		xcrun swift build --build-tests --disable-xctest --enable-swift-testing; \
-		xcrun swiftc -parse-as-library scripts/run-swift-tests.swift \
-			-F "$$developer_dir/Library/Developer/Frameworks" \
-			-framework Testing \
-			-Xlinker -rpath \
-			-Xlinker "$$developer_dir/Library/Developer/Frameworks" \
-			-Xlinker -rpath \
-			-Xlinker "$$developer_dir/Library/Developer/usr/lib" \
-			-o .build/run-swift-tests; \
+		swiftc_path="$$(xcrun --find swiftc)"; \
+		swiftc_bin_dir="$$(dirname "$$swiftc_path")"; \
+		testing_framework_dir="$$swiftc_bin_dir/../../Library/Developer/Frameworks"; \
+		testing_library_dir="$$swiftc_bin_dir/../lib/swift/macosx/testing"; \
+		if [ -d "$$testing_framework_dir/Testing.framework" ]; then \
+			xcrun swiftc -parse-as-library scripts/run-swift-tests.swift \
+				-F "$$testing_framework_dir" \
+				-framework Testing \
+				-Xlinker -rpath \
+				-Xlinker "$$testing_framework_dir" \
+				-Xlinker -rpath \
+				-Xlinker "$$developer_dir/Library/Developer/usr/lib" \
+				-o .build/run-swift-tests; \
+		elif [ -d "$$testing_library_dir/Testing.swiftmodule" ] \
+			&& [ -f "$$testing_library_dir/libTesting.dylib" ]; then \
+			xcrun swiftc -parse-as-library scripts/run-swift-tests.swift \
+				-I "$$testing_library_dir" \
+				-L "$$testing_library_dir" \
+				-lTesting \
+				-Xlinker -rpath \
+				-Xlinker "$$testing_library_dir" \
+				-o .build/run-swift-tests; \
+		elif platform_path="$$(xcrun --sdk macosx --show-sdk-platform-path 2>/dev/null)" \
+			&& [ -d "$$platform_path/Developer/Library/Frameworks/Testing.framework" ]; then \
+			platform_framework_dir="$$platform_path/Developer/Library/Frameworks"; \
+			xcrun swiftc -parse-as-library scripts/run-swift-tests.swift \
+				-F "$$platform_framework_dir" \
+				-framework Testing \
+				-Xlinker -rpath \
+				-Xlinker "$$platform_framework_dir" \
+				-Xlinker -rpath \
+				-Xlinker "$$platform_path/Developer/usr/lib" \
+				-o .build/run-swift-tests; \
+		else \
+			echo "could not locate the Swift Testing runtime" >&2; \
+			exit 1; \
+		fi; \
 		test_binary=".build/debug/CodexUsageBarPackageTests.xctest/Contents/MacOS/CodexUsageBarPackageTests"; \
 		if output="$$(.build/run-swift-tests "$$test_binary" 2>&1)"; then \
 			status=0; \

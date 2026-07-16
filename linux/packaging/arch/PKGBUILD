@@ -6,11 +6,12 @@ pkgdesc='Wayland-friendly status app for Codex usage and rate limits'
 arch=('x86_64' 'aarch64')
 url='https://github.com/conjfrnk/codex-mac-bar'
 license=('MIT')
+options=('!debug')
 depends=('gtk4>=4.10' 'dbus')
 makedepends=('cargo')
 optdepends=('gnome-shell-extension-appindicator: tray icon support under GNOME Shell')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/conjfrnk/codex-mac-bar/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-b2sums=('bece5cff65a0fd41fe492fbf34d5bfbc2ec3716b87b32e971ba86eef33fa8dc12cb0168f510886add2b058ee4ccfcae7546fc3d455b19049eedf97e8661f4cf3')
+b2sums=('2399eac37d2ce76a3163de52800983a23ae0bed68a7caed46132e446ac7669cf3e14c23effaab256e2a66f1a805d4c91a9ea9229ed3ac47aed9cc0674db38680')
 
 prepare() {
   cd "$pkgname-$pkgver/linux"

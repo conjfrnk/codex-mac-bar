@@ -49,7 +49,7 @@ visual-test: build
 		echo "visual-test requires xvfb-run (Arch package: xorg-server-xvfb)" >&2; \
 		exit 1; \
 	}
-	xvfb-run -a -s '-screen 0 2560x2160x24 -nolisten tcp' env GDK_BACKEND=x11 GSK_RENDERER=cairo $(MAKE) visual-test-display
+	xvfb-run -a -s '-screen 0 2560x2160x24 -nolisten tcp' env GTK_A11Y=none GDK_BACKEND=x11 GSK_RENDERER=cairo $(MAKE) visual-test-display
 
 visual-test-display:
 	@test -x target/release/codex-usage-bar || { \
