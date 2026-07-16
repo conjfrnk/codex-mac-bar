@@ -1,3 +1,4 @@
+import Foundation
 import CodexUsageCore
 import Testing
 @testable import CodexUsageBar
@@ -21,6 +22,7 @@ struct RendererTests {
                 appearance: .light,
                 timeframe: .thirty,
                 fixture: .success,
+                textSize: .standard,
                 width: 300,
                 height: 560
             )
@@ -36,11 +38,13 @@ struct RendererTests {
             "--render-popover", "/tmp/popover.png",
             "--width", "260",
             "--fixture", "login-approval",
+            "--text-size", "accessibility",
             "--appearance", "dark"
         ]))
         #expect(options.appearance == .dark)
         #expect(options.timeframe == .all)
         #expect(options.fixture == .loginApproval)
+        #expect(options.textSize == .accessibility)
         #expect(options.width == 260)
         #expect(options.height == 1_400)
     }
@@ -67,6 +71,8 @@ struct RendererTests {
             ["--appearance", "sepia"],
             ["--timeframe", "year"],
             ["--fixture", "unknown"],
+            ["--text-size", "huge"],
+            ["--text-size", "standard", "--text-size", "accessibility"],
             ["--width", "260.5"],
             ["--width", "219"],
             ["--width", "259"],
@@ -99,5 +105,25 @@ struct RendererTests {
             ]))
             #expect(options.height == height)
         }
+    }
+
+    @Test
+    func testAccessibilityTextRenderKeepsLiveHeightFooterVisible() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-usage-large-text-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("popover.png")
+
+        #expect(try UsagePopoverRenderer.runIfRequested(arguments: [
+            "app",
+            "--render-popover", output.path,
+            "--fixture", "success",
+            "--text-size", "accessibility",
+            "--width", "300",
+            "--height", "560"
+        ]))
+
+        let data = try Data(contentsOf: output)
+        #expect(data.count > 10_000)
     }
 }

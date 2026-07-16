@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CodexUsageCore
+import Darwin
 import Foundation
 import SwiftUI
 import Testing
@@ -13,11 +14,19 @@ struct UIStateTests {
     @MainActor
     func testRequiresApprovalIsRegisteredAndCanBeUnregisteredWithoutReregistering() {
         let service = FakeLaunchAtLoginService(status: .requiresApproval)
-        let controller = LaunchAtLoginController(service: service)
+        let settingsOpener = FakeLaunchAtLoginSettingsOpener()
+        let controller = LaunchAtLoginController(
+            service: service,
+            settingsOpener: settingsOpener
+        )
 
         #expect(controller.state == .requiresApproval)
         #expect(controller.isEnabled)
         #expect(controller.canToggle)
+        #expect(controller.requiresApproval)
+
+        controller.openSystemSettingsLoginItems()
+        #expect(settingsOpener.openCount == 1)
 
         controller.setEnabled(true)
         #expect(service.registerCount == 0)
@@ -25,6 +34,8 @@ struct UIStateTests {
         controller.setEnabled(false)
         #expect(service.unregisterCount == 1)
         #expect(controller.state == .disabled)
+        controller.openSystemSettingsLoginItems()
+        #expect(settingsOpener.openCount == 1)
     }
 
     @Test
@@ -54,6 +65,107 @@ struct UIStateTests {
         #expect(controller.statusText != nil)
         controller.refresh()
         #expect(controller.statusText == nil)
+    }
+
+    @Test
+    @MainActor
+    func testPresentationTickerIsTolerantAndStopsWithTheMenuLifecycle() {
+        var now = fixedNow
+        let ticker = UsagePresentationTicker(now: { now })
+
+        #expect(UsagePresentationTicker.cadence == 30)
+        #expect(UsagePresentationTicker.tolerance == 5)
+        #expect(!ticker.isRunning)
+        #expect(ticker.date == fixedNow)
+
+        ticker.start()
+        #expect(ticker.isRunning)
+        now = fixedNow.addingTimeInterval(31)
+        ticker.updateDate()
+        #expect(ticker.date == now)
+
+        ticker.stop()
+        #expect(!ticker.isRunning)
+    }
+
+    @Test
+    func testCodexExecutableSelectionValidatesPersistsAndAppliesWithoutLaunching() throws {
+        let suiteName = "local.codex-usage-bar.tests.\(UUID().uuidString)"
+        let preferences = try #require(UserDefaults(suiteName: suiteName))
+        defer { preferences.removePersistentDomain(forName: suiteName) }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-usage-selection-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Deliberately not a runnable program. Validation must inspect file type
+        // and permissions only; attempting to launch it would fail this test.
+        let executable = directory.appendingPathComponent("codex")
+        try Data("not an executable format".utf8).write(to: executable)
+        #expect(Darwin.chmod(executable.path, 0o700) == 0)
+
+        var appliedEnvironment: [String: String] = [:]
+        let storedPath = try UsagePreferences.setCodexExecutable(
+            executable,
+            preferences: preferences,
+            setEnvironment: { appliedEnvironment[$0] = $1 }
+        )
+        #expect(storedPath == executable.standardizedFileURL.path)
+        #expect(preferences.string(forKey: UsagePreferences.codexExecutablePathKey) == storedPath)
+        #expect(
+            appliedEnvironment[UsagePreferences.codexExecutableEnvironmentKey] == storedPath
+        )
+
+        appliedEnvironment.removeAll()
+        #expect(UsagePreferences.applyPersistedCodexExecutable(
+            preferences: preferences,
+            environment: [:],
+            setEnvironment: { appliedEnvironment[$0] = $1 }
+        ))
+        #expect(
+            appliedEnvironment[UsagePreferences.codexExecutableEnvironmentKey] == storedPath
+        )
+
+        #expect(Darwin.chmod(executable.path, 0o600) == 0)
+        appliedEnvironment.removeAll()
+        #expect(!UsagePreferences.applyPersistedCodexExecutable(
+            preferences: preferences,
+            environment: [:],
+            setEnvironment: { appliedEnvironment[$0] = $1 }
+        ))
+        #expect(preferences.string(forKey: UsagePreferences.codexExecutablePathKey) == nil)
+        #expect(appliedEnvironment.isEmpty)
+
+        #expect(throws: CodexExecutablePreferenceError.self) {
+            try UsagePreferences.setCodexExecutable(
+                directory,
+                preferences: preferences,
+                setEnvironment: { _, _ in }
+            )
+        }
+    }
+
+    @Test
+    func testExplicitCodexEnvironmentOverrideWinsOverPersistedSelection() throws {
+        let suiteName = "local.codex-usage-bar.tests.\(UUID().uuidString)"
+        let preferences = try #require(UserDefaults(suiteName: suiteName))
+        defer { preferences.removePersistentDomain(forName: suiteName) }
+
+        let executable = URL(fileURLWithPath: "/bin/sh")
+        preferences.set(executable.path, forKey: UsagePreferences.codexExecutablePathKey)
+        var appliedEnvironment: [String: String] = [:]
+
+        #expect(!UsagePreferences.applyPersistedCodexExecutable(
+            preferences: preferences,
+            environment: [UsagePreferences.codexExecutableEnvironmentKey: "/tmp/fake-codex"],
+            setEnvironment: { appliedEnvironment[$0] = $1 }
+        ))
+        #expect(appliedEnvironment.isEmpty)
+        #expect(
+            preferences.string(forKey: UsagePreferences.codexExecutablePathKey)
+                == executable.path
+        )
     }
 
     @Test
@@ -834,6 +946,14 @@ private final class FakeLaunchAtLoginService: LaunchAtLoginServicing {
         unregisterCount += 1
         if let unregisterError { throw unregisterError }
         status = .notRegistered
+    }
+}
+
+private final class FakeLaunchAtLoginSettingsOpener: LaunchAtLoginSettingsOpening {
+    private(set) var openCount = 0
+
+    func openSystemSettingsLoginItems() {
+        openCount += 1
     }
 }
 

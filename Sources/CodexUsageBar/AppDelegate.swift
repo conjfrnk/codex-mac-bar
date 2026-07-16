@@ -6,12 +6,15 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let refreshInterval: TimeInterval = 5 * 60
+    private static let refreshTimerTolerance: TimeInterval = 30
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menuSize = UsagePopoverView.preferredSize
     private let menu = NSMenu()
     private let viewModel = UsageViewModel(client: CodexAppServerClient())
+    private let presentationTicker = UsagePresentationTicker()
     private var cancellables = Set<AnyCancellable>()
+    private var statusTimeframe = UsagePreferences.selectedTimeframe
     private var refreshTimer: Timer?
     private var usageHostingView: NSView?
     private var cachedUsageScrollView: NSScrollView?
@@ -27,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
+        presentationTicker.stop()
     }
 
     private func configureStatusItem() {
@@ -46,7 +50,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
         menu.removeAllItems()
 
-        let hostingView = NSHostingView(rootView: UsagePopoverView(viewModel: viewModel))
+        let hostingView = NSHostingView(
+            rootView: UsagePopoverView(
+                viewModel: viewModel,
+                presentationTicker: presentationTicker,
+                onLocateCodex: { [weak self] in
+                    self?.locateCodexExecutable()
+                }
+            )
+        )
         hostingView.frame = NSRect(origin: .zero, size: menuSize)
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
@@ -58,12 +70,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func bindStatusTitle() {
-        viewModel.objectWillChange
+        Publishers.CombineLatest(viewModel.$snapshot, viewModel.$state)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                DispatchQueue.main.async {
-                    self?.updateStatusTitle()
-                }
+            .sink { [weak self] _, _ in
+                self?.updateStatusTitle()
             }
             .store(in: &cancellables)
     }
@@ -72,7 +82,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                self?.updateStatusTitle()
+                guard let self else { return }
+                let timeframe = UsagePreferences.selectedTimeframe
+                guard timeframe != self.statusTimeframe else { return }
+                self.statusTimeframe = timeframe
+                self.updateStatusTitle()
             }
             .store(in: &cancellables)
     }
@@ -98,10 +112,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         // Changing app activation while this menu begins tracking can dismiss it immediately.
         viewModel.beginMenuSession()
+        presentationTicker.start()
         resetUsageScrollPosition()
         if viewModel.shouldRefresh(maxAge: Self.refreshInterval) {
             viewModel.refresh()
         }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        presentationTicker.stop()
     }
 
     /// The popover's NSMenuItem view is created once and reused for every open, so its
@@ -146,7 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startAutoRefresh() {
         refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 // The timer is created before the initial request completes, so an
@@ -156,8 +175,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.viewModel.refresh()
             }
         }
-        if let refreshTimer {
-            RunLoop.main.add(refreshTimer, forMode: .common)
+        timer.tolerance = Self.refreshTimerTolerance
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
+    }
+
+    private func locateCodexExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "Locate Codex"
+        panel.message = "Choose the Codex CLI executable. It will be validated without being opened."
+        panel.prompt = "Use Codex"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try UsagePreferences.setCodexExecutable(url)
+            viewModel.refresh()
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Codex executable not selected"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
         }
     }
 }

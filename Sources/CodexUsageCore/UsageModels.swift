@@ -320,6 +320,18 @@ public struct RateLimitSnapshot: Decodable, Equatable, Sendable {
         }
         decodingIssues = issues
     }
+
+    /// Identifiers and decoding metadata alone do not make a snapshot useful to
+    /// the presentation. This distinction lets a lossy, effectively empty map
+    /// entry fall back to the still-valid legacy top-level snapshot.
+    public var hasMeaningfulPresentationData: Bool {
+        primary != nil
+            || secondary != nil
+            || credits?.hasMeaningfulPresentationData == true
+            || individualLimit?.hasMeaningfulPresentationData == true
+            || planType?.hasDisplayableContent == true
+            || rateLimitReachedType?.hasDisplayableContent == true
+    }
 }
 
 public struct RateLimitResetCreditsSummary: Decodable, Equatable, Sendable {
@@ -340,6 +352,9 @@ public struct RateLimitResetCreditsSummary: Decodable, Equatable, Sendable {
 }
 
 public struct AccountRateLimitsResponse: Decodable, Equatable, Sendable {
+    private static let malformedResponseIssue = "response: malformed value"
+    private static let failedRequestIssue = "response: optional request failed"
+
     public let rateLimits: RateLimitSnapshot?
     public let rateLimitsByLimitId: [String: RateLimitSnapshot]?
     public let rateLimitResetCredits: RateLimitResetCreditsSummary?
@@ -417,15 +432,46 @@ public struct AccountRateLimitsResponse: Decodable, Equatable, Sendable {
     }
 
     public var preferredCodexLimit: RateLimitSnapshot? {
-        if let codex = rateLimitsByLimitId?["codex"] {
+        if let codex = rateLimitsByLimitId?["codex"], codex.hasMeaningfulPresentationData {
             return codex
         }
         if let key = rateLimitsByLimitId?.keys.sorted().first(where: {
             rateLimitsByLimitId?[$0]?.limitId == "codex"
+                && rateLimitsByLimitId?[$0]?.hasMeaningfulPresentationData == true
         }) {
             return rateLimitsByLimitId?[key]
         }
+        guard rateLimits?.hasMeaningfulPresentationData == true else { return nil }
         return rateLimits
+    }
+
+    /// True when the response contains something the rate-limit presentation
+    /// can actually show. Data-quality warnings do not count as availability.
+    public var hasMeaningfulData: Bool {
+        rateLimitResetCredits != nil
+            || preferredCodexLimit?.hasMeaningfulPresentationData == true
+    }
+
+    /// A malformed optional result must not discard valid usage, but it must
+    /// remain distinguishable from a server that supplied no rate-limit data.
+    static func malformedOuterResponse() -> Self {
+        Self(
+            rateLimits: nil,
+            rateLimitsByLimitId: nil,
+            rateLimitResetCredits: nil,
+            decodingIssues: [malformedResponseIssue]
+        )
+    }
+
+    /// Request 3 is optional across CLI versions. Preserve its failure as one
+    /// bounded, nonfatal warning without exposing an arbitrary server message.
+    static func failedOptionalRequest() -> Self {
+        Self(
+            rateLimits: nil,
+            rateLimitsByLimitId: nil,
+            rateLimitResetCredits: nil,
+            decodingIssues: [failedRequestIssue]
+        )
     }
 }
 
@@ -465,6 +511,43 @@ private struct DynamicCodingKey: CodingKey {
     init?(intValue: Int) {
         stringValue = String(intValue)
         self.intValue = intValue
+    }
+}
+
+private extension CreditsSnapshot {
+    var hasMeaningfulPresentationData: Bool {
+        hasCredits != nil
+            || unlimited == true
+            || balance?.hasDisplayableContent == true
+            || remaining != nil
+            || used != nil
+    }
+}
+
+private extension SpendControlLimitSnapshot {
+    var hasMeaningfulPresentationData: Bool {
+        limit?.hasDisplayableContent == true
+            || used?.hasDisplayableContent == true
+            || remainingPercent != nil
+            || usedPercent != nil
+            || resetsAt?.isPresentableUnixTimestamp == true
+    }
+}
+
+private extension String {
+    var hasDisplayableContent: Bool {
+        unicodeScalars.contains { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+                && !scalar.isUnsafeFormatCharacter
+        }
+    }
+}
+
+private extension Double {
+    var isPresentableUnixTimestamp: Bool {
+        isFinite && (0...253_402_300_799).contains(self)
     }
 }
 

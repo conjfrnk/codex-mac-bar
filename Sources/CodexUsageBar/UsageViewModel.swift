@@ -278,8 +278,13 @@ final class UsageViewModel: ObservableObject {
 /// otherwise hide thousands of combining scalars inside one apparent character.
 enum UserFacingErrorMessage {
     static func clean(_ error: Error, maximumUnicodeScalars: Int) -> String {
-        BoundedDisplayText.clean(
+        let redacted = DiagnosticSanitizer.clean(
             String(describing: error),
+            maxCharacters: 4_096,
+            maxUTF8Bytes: 16 * 1_024
+        )
+        return BoundedDisplayText.clean(
+            redacted,
             maximumUnicodeScalars: maximumUnicodeScalars,
             emptyFallback: "Unknown error"
         )

@@ -1,0 +1,318 @@
+{
+  "schemaVersion": 1,
+  "rateLimitCases": [
+    {
+      "name": "legacy-fallback-when-codex-map-entry-is-degraded",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "legacy",
+            "primary": {
+              "usedPercent": 55,
+              "windowDurationMins": 300,
+              "resetsAt": 1800000000
+            },
+            "planType": "plus"
+          },
+          "rateLimitsByLimitId": {
+            "codex": {
+              "limitId": "codex",
+              "primary": {
+                "usedPercent": "malformed"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "legacy",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": 55,
+        "primaryWindowDurationMins": 300,
+        "individualUsedPercent": null,
+        "planType": "plus",
+        "resetCreditCount": null,
+        "warningPaths": [
+          "rateLimitsByLimitId.codex.primary"
+        ]
+      }
+    },
+    {
+      "name": "meaningful-limit-id-alias-beats-legacy",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "legacy",
+            "primary": {
+              "usedPercent": 55
+            }
+          },
+          "rateLimitsByLimitId": {
+            "renamed-codex-bucket": {
+              "limitId": "codex",
+              "primary": {
+                "usedPercent": 42,
+                "windowDurationMins": 10080
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "codex",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": 42,
+        "primaryWindowDurationMins": 10080,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "nonpresentable-codex-fields-fall-back-to-legacy",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "legacy",
+            "primary": {
+              "usedPercent": 61,
+              "windowDurationMins": 300
+            },
+            "planType": "plus"
+          },
+          "rateLimitsByLimitId": {
+            "codex": {
+              "limitId": "codex",
+              "credits": {
+                "unlimited": false,
+                "balance": "\u0001\u202e",
+                "total": 100
+              },
+              "individualLimit": {
+                "limit": "\u200b",
+                "used": "\u0002",
+                "resetsAt": 1e300
+              },
+              "planType": "\u2060",
+              "rateLimitReachedType": "\ufeff"
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "legacy",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": 61,
+        "primaryWindowDurationMins": 300,
+        "individualUsedPercent": null,
+        "planType": "plus",
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "remaining-percent-derives-used-percent",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "codex",
+            "individualLimit": {
+              "limit": "100.00",
+              "used": "37.00",
+              "remainingPercent": 63,
+              "resetsAt": 1800000000
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "codex",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": 37,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "default-ignorable-codex-fields-fall-back-to-legacy",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "legacy",
+            "primary": {
+              "usedPercent": 64,
+              "windowDurationMins": 300
+            }
+          },
+          "rateLimitsByLimitId": {
+            "codex": {
+              "limitId": "codex",
+              "planType": "\u00ad\u034f\u0600\u180e\ufe0f"
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "legacy",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": 64,
+        "primaryWindowDurationMins": 300,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "identifiers-alone-are-not-meaningful",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimitsByLimitId": {
+            "codex": {
+              "limitId": "codex",
+              "limitName": "Codex"
+            }
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": null,
+        "hasMeaningfulData": false,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "legacy-identifiers-alone-are-not-meaningful",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "codex",
+            "limitName": "Codex"
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": null,
+        "hasMeaningfulData": false,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "lossy-fields-preserve-valid-siblings-and-warning-paths",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimits": {
+            "limitId": "codex",
+            "credits": {
+              "hasCredits": true,
+              "balance": false
+            },
+            "planType": "team"
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": "codex",
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": "team",
+        "resetCreditCount": null,
+        "warningPaths": [
+          "rateLimits.credits.balance"
+        ]
+      }
+    },
+    {
+      "name": "reset-credits-alone-are-meaningful",
+      "source": {
+        "kind": "result",
+        "value": {
+          "rateLimitResetCredits": {
+            "availableCount": 0
+          }
+        }
+      },
+      "expected": {
+        "selectedLimitId": null,
+        "hasMeaningfulData": true,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": 0,
+        "warningPaths": []
+      }
+    },
+    {
+      "name": "malformed-whole-result-is-a-nonfatal-warning",
+      "source": {
+        "kind": "result",
+        "value": "malformed"
+      },
+      "expected": {
+        "selectedLimitId": null,
+        "hasMeaningfulData": false,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": [
+          "response"
+        ],
+        "exactWarnings": [
+          "response: malformed value"
+        ]
+      }
+    },
+    {
+      "name": "optional-json-rpc-error-is-a-nonfatal-warning",
+      "source": {
+        "kind": "jsonRpcError",
+        "value": {
+          "code": -32601,
+          "message": "unsupported; Authorization: Bearer synthetic-contract-token-value"
+        }
+      },
+      "expected": {
+        "selectedLimitId": null,
+        "hasMeaningfulData": false,
+        "primaryUsedPercent": null,
+        "primaryWindowDurationMins": null,
+        "individualUsedPercent": null,
+        "planType": null,
+        "resetCreditCount": null,
+        "warningPaths": [
+          "response"
+        ],
+        "exactWarnings": [
+          "response: optional request failed"
+        ]
+      }
+    }
+  ]
+}

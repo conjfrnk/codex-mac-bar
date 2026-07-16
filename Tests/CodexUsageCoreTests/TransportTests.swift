@@ -256,6 +256,160 @@ struct TransportTests {
     }
 
     @Test
+    func testMalformedWholeRateLimitResultPreservesUsageAndReportsQualityWarning() async throws {
+        let executable = try TemporaryExecutable(script: fakeServerScript(
+            rateLimitAction: "printf '%s\\n' '{\"id\":3,\"result\":\"malformed\"}'"
+        ))
+        let client = CodexAppServerClient(
+            timeout: 1,
+            executableURL: executable.url,
+            rateLimitGrace: 0.05,
+            signalGrace: 0.03
+        )
+
+        let snapshot = try await client.fetchUsageSnapshot()
+
+        #expect(snapshot.sortedBuckets.map(\.tokens) == [7])
+        #expect(snapshot.rateLimits?.decodingIssues == ["response: malformed value"])
+        #expect(snapshot.rateLimits?.hasMeaningfulData == false)
+    }
+
+    @Test
+    func testOptionalRateLimitJSONRPCErrorPreservesUsageAndReportsQualityWarning() async throws {
+        let executable = try TemporaryExecutable(script: fakeServerScript(
+            rateLimitAction: "printf '%s\\n' '{\"id\":3,\"error\":{\"code\":-32601,\"message\":\"Authorization: Bearer synthetic-rate-error-token\"}}'"
+        ))
+        let client = CodexAppServerClient(
+            timeout: 1,
+            executableURL: executable.url,
+            rateLimitGrace: 0.05,
+            signalGrace: 0.03
+        )
+
+        let snapshot = try await client.fetchUsageSnapshot()
+
+        #expect(snapshot.sortedBuckets.map(\.tokens) == [7])
+        #expect(snapshot.rateLimits?.decodingIssues == ["response: optional request failed"])
+        #expect(snapshot.rateLimits?.hasMeaningfulData == false)
+        #expect(!snapshot.rateLimits!.decodingIssues.joined().contains("synthetic-rate-error-token"))
+    }
+
+    @Test
+    func testSyntheticCredentialsAreRedactedFromSubprocessDiagnostics() async throws {
+        let executable = try TemporaryExecutable(script: """
+        #!/bin/sh
+        printf '%s\\n' 'Authorization: Bearer synthetic-bearer-credential' >&2
+        printf '%s\\n' 'OPENAI_API_KEY=sk-synthetic-api-key-value' >&2
+        printf '%s\\n' 'endpoint=https://synthetic-user:synthetic-password@example.test/path?token=synthetic-query-token' >&2
+        exit 31
+        """)
+        let client = CodexAppServerClient(
+            timeout: 1,
+            executableURL: executable.url,
+            rateLimitGrace: 0.05,
+            signalGrace: 0.03
+        )
+
+        do {
+            _ = try await client.fetchUsageSnapshot()
+            Issue.record("Expected the synthetic subprocess to exit")
+        } catch {
+            let description = String(describing: error)
+            #expect(description.contains("[REDACTED]"), "\(description)")
+            for syntheticSecret in [
+                "synthetic-bearer-credential",
+                "sk-synthetic-api-key-value",
+                "synthetic-user",
+                "synthetic-password",
+                "synthetic-query-token"
+            ] {
+                #expect(!description.contains(syntheticSecret), "\(description)")
+            }
+        }
+    }
+
+    @Test
+    func testSyntheticCredentialsAreRedactedFromServerDiagnostics() async throws {
+        let executable = try TemporaryExecutable(script: """
+        #!/bin/sh
+        set -eu
+        IFS= read -r _
+        printf '%s\\n' '{"id":1,"error":{"code":-32000,"message":"api_key=synthetic-server-key https://synthetic-user:synthetic-password@example.test/private"}}'
+        while IFS= read -r _; do :; done
+        """)
+        let client = CodexAppServerClient(
+            timeout: 1,
+            executableURL: executable.url,
+            rateLimitGrace: 0.05,
+            signalGrace: 0.03
+        )
+
+        do {
+            _ = try await client.fetchUsageSnapshot()
+            Issue.record("Expected the synthetic server error")
+        } catch {
+            let description = String(describing: error)
+            #expect(description.contains("[REDACTED]"), "\(description)")
+            for syntheticSecret in [
+                "synthetic-server-key", "synthetic-user", "synthetic-password"
+            ] {
+                #expect(!description.contains(syntheticSecret), "\(description)")
+            }
+        }
+    }
+
+    @Test
+    func testQuotedAndFormatControlledCredentialsAreRedacted() {
+        let noncharacter = String(Unicode.Scalar(0xFDD0)!)
+        let planeEndNoncharacter = String(Unicode.Scalar(0x10FFFF)!)
+        let diagnostics: [(String, String)] = [
+            (#"{"Authorization":"Bearer synthetic-json-authorization"}"#,
+             "synthetic-json-authorization"),
+            (#"{"Proxy-Authorization":"Basic synthetic-proxy-authorization"}"#,
+             "synthetic-proxy-authorization"),
+            (#"{"api_key":"synthetic-json-api-key"}"#,
+             "synthetic-json-api-key"),
+            (#"{"openaiApiKey":"synthetic-camel-api-key"}"#,
+             "synthetic-camel-api-key"),
+            (#"{"accessToken":"synthetic-camel-access-token"}"#,
+             "synthetic-camel-access-token"),
+            ("Authoriz\u{200B}ation: Bearer synthetic-format-authorization",
+             "synthetic-format-authorization"),
+            ("Authoriz\u{00AD}ation: Bearer synthetic-soft-hyphen-secret",
+             "synthetic-soft-hyphen-secret"),
+            ("Authoriz\u{0600}ation: Bearer synthetic-arabic-format-secret",
+             "synthetic-arabic-format-secret"),
+            ("Authoriz\u{180E}ation: Bearer synthetic-mongolian-format-secret",
+             "synthetic-mongolian-format-secret"),
+            ("Authoriz\u{FE0F}ation: Bearer synthetic-variation-secret",
+             "synthetic-variation-secret"),
+            ("Authoriz\u{034F}ation: Bearer synthetic-grapheme-secret",
+             "synthetic-grapheme-secret"),
+            ("Authoriz" + noncharacter + "ation: Bearer synthetic-noncharacter-secret",
+             "synthetic-noncharacter-secret"),
+            ("Authoriz" + planeEndNoncharacter + "ation: Bearer synthetic-plane-end-secret",
+             "synthetic-plane-end-secret"),
+            ("to\u{202E}ken=synthetic-format-token",
+             "synthetic-format-token"),
+            (#"api_key="top secret"#,
+             "top secret"),
+            (#"api_key="top\"secret"#,
+             #"top\"secret"#)
+        ]
+
+        for (diagnostic, secret) in diagnostics {
+            let cleaned = DiagnosticSanitizer.clean(diagnostic)
+            #expect(cleaned.contains("[REDACTED]"), "\(cleaned)")
+            #expect(!cleaned.contains(secret), "\(cleaned)")
+        }
+
+        let longCredentialURL = "https://synthetic-user:"
+            + String(repeating: "p", count: 5_000)
+            + "@example.test/private"
+        #expect(DiagnosticSanitizer.clean(longCredentialURL) == "[REDACTED]")
+    }
+
+    @Test
     func testMalformedProtocolDataAfterUsageRemainsFatal() async throws {
         let executable = try TemporaryExecutable(script: fakeServerScript(
             rateLimitAction: "",

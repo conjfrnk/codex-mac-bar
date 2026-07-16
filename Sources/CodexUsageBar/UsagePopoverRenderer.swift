@@ -53,6 +53,7 @@ enum UsagePopoverRenderer {
         }
         .frame(width: size.width, height: size.height)
         .preferredColorScheme(scheme)
+        .dynamicTypeSize(options.textSize.dynamicTypeSize)
 
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.frame = NSRect(origin: .zero, size: size)
@@ -88,7 +89,12 @@ enum UsagePopoverRenderer {
             throw PopoverRenderFailure("Could not allocate the popover bitmap")
         }
         containerView.cacheDisplay(in: containerView.bounds, to: representation)
-        try validateLandmarkPixels(representation, size: size, fixture: options.fixture)
+        try validateLandmarkPixels(
+            representation,
+            size: size,
+            fixture: options.fixture,
+            textSize: options.textSize
+        )
         guard let data = representation.representation(using: .png, properties: [:]),
               data.count > 10_000
         else {
@@ -99,6 +105,7 @@ enum UsagePopoverRenderer {
             "PASS render popover appearance=\(options.appearance.rawValue) "
                 + "timeframe=\(options.timeframe.rawValue) size=\(options.width)x\(options.height) "
                 + "fixture=\(options.fixture.rawValue) "
+                + "text-size=\(options.textSize.rawValue) "
                 + "bytes=\(data.count) path=\(outputURL.path)"
         )
         return true
@@ -107,7 +114,8 @@ enum UsagePopoverRenderer {
     private static func validateLandmarkPixels(
         _ image: NSBitmapImageRep,
         size: NSSize,
-        fixture: PopoverRenderOptions.Fixture
+        fixture: PopoverRenderOptions.Fixture,
+        textSize: PopoverRenderOptions.TextSize
     ) throws {
         guard image.pixelsWide > 0,
               image.pixelsHigh > 0,
@@ -136,11 +144,48 @@ enum UsagePopoverRenderer {
             )
         }
 
+        // Probe each required action in a disjoint, layout-specific region at
+        // the bottom of the bitmap. A single aggregate footer region could be
+        // falsely satisfied by scroll content after the footer disappeared.
+        let footerLandmarks: [(String, CGRect, CGFloat)]
+        switch fixture {
+        case .loginApproval:
+            footerLandmarks = [
+                ("Refresh", CGRect(x: 16, y: size.height - 105, width: 150, height: 30), 120),
+                ("Quit", CGRect(x: size.width - 110, y: size.height - 105, width: 98, height: 30), 80),
+                ("Open at Login", CGRect(x: 16, y: size.height - 77, width: 220, height: 28), 180),
+                ("Open Login Items Settings", CGRect(x: 16, y: size.height - 33, width: size.width - 25, height: 30), 300)
+            ]
+        case .error, .stale:
+            footerLandmarks = [
+                ("Refresh", CGRect(x: 16, y: size.height - 90, width: 150, height: 30), 120),
+                ("Quit", CGRect(x: size.width - 110, y: size.height - 90, width: 98, height: 30), 80),
+                ("Locate Codex", CGRect(x: 16, y: size.height - 60, width: 220, height: 28), 180),
+                ("Open at Login", CGRect(x: 16, y: size.height - 32, width: 220, height: 28), 180)
+            ]
+        default:
+            footerLandmarks = [
+                ("Refresh", CGRect(x: 16, y: size.height - 82, width: 150, height: 32), 120),
+                ("Quit", CGRect(x: size.width - 110, y: size.height - 82, width: 98, height: 32), 80),
+                ("Open at Login", CGRect(x: 16, y: size.height - 52, width: 220, height: 32), 180)
+            ]
+        }
+        for (action, region, minimumInk) in footerLandmarks {
+            try requireInk(
+                name: "\(textSize.rawValue) footer action \(action)",
+                region: region,
+                minimum: minimumInk,
+                image: image,
+                size: size,
+                background: background
+            )
+        }
+
         if fixture == .loading || fixture == .error {
             try requireInk(
-                name: "status and actions",
-                region: CGRect(x: 12, y: 75, width: size.width - 24, height: 210),
-                minimum: fixture == .loading ? 350 : 500,
+                name: "loading or error status",
+                region: CGRect(x: 12, y: 52, width: size.width - 24, height: 150),
+                minimum: 300,
                 image: image,
                 size: size,
                 background: background
@@ -164,17 +209,16 @@ enum UsagePopoverRenderer {
             )
         }
 
-        let historyRegion = size.height >= 1_000
-            ? CGRect(x: 12, y: 580, width: size.width - 24, height: 180)
-            : CGRect(x: 12, y: 470, width: size.width - 24, height: max(size.height - 470, 1))
-        try requireInk(
-            name: "daily history",
-            region: historyRegion,
-            minimum: 300,
-            image: image,
-            size: size,
-            background: background
-        )
+        if size.height >= 1_000 {
+            try requireInk(
+                name: "daily history",
+                region: CGRect(x: 12, y: 580, width: size.width - 24, height: 180),
+                minimum: 300,
+                image: image,
+                size: size,
+                background: background
+            )
+        }
 
         // The lower sections are intentionally below the fold at normal menu
         // heights. Only assert them when the requested bitmap is tall enough to
@@ -186,14 +230,10 @@ enum UsagePopoverRenderer {
             // treating success-state coordinates as a universal invariant.
             let lowerLandmarks: [(String, CGRect, CGFloat)] = fixture.hasCompactHistoryLayout
                 ? [
-                    ("rate limits", CGRect(x: 12, y: 520, width: size.width - 24, height: 420), 700),
-                    ("refresh footer", CGRect(x: 12, y: 850, width: size.width - 24, height: 120), 150),
-                    ("actions", CGRect(x: 12, y: 900, width: size.width - 24, height: 220), 300)
+                    ("rate limits", CGRect(x: 12, y: 520, width: size.width - 24, height: 420), 700)
                 ]
                 : [
-                    ("rate limits", CGRect(x: 12, y: 740, width: size.width - 24, height: 290), 700),
-                    ("refresh footer", CGRect(x: 12, y: 1_020, width: size.width - 24, height: 75), 150),
-                    ("actions", CGRect(x: 12, y: 1_080, width: size.width - 24, height: 120), 300)
+                    ("rate limits", CGRect(x: 12, y: 740, width: size.width - 24, height: 290), 700)
                 ]
             for (name, region, minimumInk) in lowerLandmarks {
                 try requireInk(
@@ -286,6 +326,7 @@ enum UsagePopoverRenderer {
         var appearance: PopoverRenderOptions.Appearance = .light
         var timeframe: UsageTimeframe = .thirty
         var fixture: PopoverRenderOptions.Fixture = .success
+        var textSize: PopoverRenderOptions.TextSize = .standard
         var width = 300
         var height = 560
         var seen = Set<String>()
@@ -301,7 +342,7 @@ enum UsagePopoverRenderer {
 
         while index < tokens.count {
             let option = tokens[index]
-            guard ["--render-popover", "--appearance", "--timeframe", "--fixture", "--width", "--height"].contains(option) else {
+            guard ["--render-popover", "--appearance", "--timeframe", "--fixture", "--text-size", "--width", "--height"].contains(option) else {
                 throw PopoverRenderFailure("Unknown render option: \(option)")
             }
             guard seen.insert(option).inserted else {
@@ -329,6 +370,11 @@ enum UsagePopoverRenderer {
                     )
                 }
                 fixture = parsed
+            case "--text-size":
+                guard let parsed = PopoverRenderOptions.TextSize(rawValue: rawValue) else {
+                    throw PopoverRenderFailure("--text-size must be standard or accessibility")
+                }
+                textSize = parsed
             case "--width":
                 width = try dimension(rawValue, option: option, range: 260...2_000)
             case "--height":
@@ -347,6 +393,7 @@ enum UsagePopoverRenderer {
             appearance: appearance,
             timeframe: timeframe,
             fixture: fixture,
+            textSize: textSize,
             width: width,
             height: height
         )
@@ -583,6 +630,20 @@ struct PopoverRenderOptions: Equatable {
         case dark
     }
 
+    enum TextSize: String, Equatable {
+        case standard
+        case accessibility
+
+        var dynamicTypeSize: DynamicTypeSize {
+            switch self {
+            case .standard:
+                return .large
+            case .accessibility:
+                return .accessibility1
+            }
+        }
+    }
+
     enum Fixture: String, CaseIterable, Equatable {
         case success
         case loading
@@ -619,6 +680,7 @@ struct PopoverRenderOptions: Equatable {
     let appearance: Appearance
     let timeframe: UsageTimeframe
     let fixture: Fixture
+    let textSize: TextSize
     let width: Int
     let height: Int
 }

@@ -1,0 +1,199 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS 26 / Swift verification
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Run authoritative macOS verification
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p .build/ci-logs
+          make verify 2>&1 | tee .build/ci-logs/macos-verify.log
+
+      - name: Upload macOS diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-verification-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            .build/ci-logs/
+            .build/popover-snapshots/
+
+  linux:
+    name: Linux / Rust ${{ matrix.rust }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - 1.92.0
+          - stable
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build and validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            dbus-x11 \
+            desktop-file-utils \
+            libdbus-1-dev \
+            libgtk-4-dev \
+            libxml2-utils \
+            pkg-config \
+            python3 \
+            xvfb
+
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install "${{ matrix.rust }}" \
+            --profile minimal --component clippy --component rustfmt
+          rustup override set "${{ matrix.rust }}"
+          rustc --version --verbose
+          cargo --version
+
+      - name: Run Rust verification
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p linux/target/ci-logs
+          if [[ "${{ matrix.rust }}" == stable ]]; then
+            make verify 2>&1 | tee linux/target/ci-logs/linux-stable-verify.log
+          else
+            {
+              make check-version
+              make -C linux check
+              make -C linux test
+            } 2>&1 | tee linux/target/ci-logs/linux-msrv-verify.log
+          fi
+
+      - name: Check dependency licenses and sources
+        if: matrix.rust == 'stable'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo metadata --manifest-path linux/Cargo.toml --locked --format-version 1 \
+            | python3 scripts/check-cargo-policy.py \
+            2>&1 | tee linux/target/ci-logs/cargo-policy.log
+
+      - name: Check RustSec advisories
+        if: matrix.rust == 'stable'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file linux/Cargo.lock \
+            2>&1 | tee linux/target/ci-logs/cargo-audit.log
+
+      - name: Upload Linux renders and diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-${{ matrix.rust }}-verification-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            linux/target/ci-logs/
+            linux/target/parity-snapshots/
+            linux/target/dist/
+
+  arch-package:
+    name: Arch Linux native package verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: archlinux:base-devel@sha256:212b1e518e94ee9c52be55e8a32da75fcf11e7b5610b80b49479e67880102406
+    steps:
+      - name: Install native Arch verification tools
+        run: |
+          pacman -Syu --noconfirm --needed \
+            dbus \
+            desktop-file-utils \
+            git \
+            gtk4 \
+            namcap \
+            python \
+            rust
+
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Create unprivileged package builder
+        shell: bash
+        run: |
+          useradd --create-home --user-group package-builder
+          chown -R package-builder:package-builder "$GITHUB_WORKSPACE"
+
+      - name: Build and inspect native Arch package
+        shell: bash
+        run: |
+          set -o pipefail
+          runuser -u package-builder -- mkdir -p linux/target/ci-logs
+          {
+            runuser -u package-builder -- make check-version
+            runuser -u package-builder -- make -C linux dist-reproducible
+            runuser -u package-builder -- make -C linux package-metadata-check
+            runuser -u package-builder -- make -C linux arch-package
+
+            mapfile -t packages < <(
+              find linux/packaging/arch -maxdepth 1 -type f \
+                -name 'codex-usage-bar-*.pkg.tar.*' -print
+            )
+            test "${#packages[@]}" -ge 1
+            version="$(< VERSION)"
+            mapfile -t main_packages < <(
+              find linux/packaging/arch -maxdepth 1 -type f \
+                -name "codex-usage-bar-$version-*.pkg.tar.*" -print
+            )
+            test "${#main_packages[@]}" -eq 1
+            runuser -u package-builder -- \
+              namcap linux/packaging/arch/PKGBUILD "${packages[@]}" \
+              2>&1 | tee linux/target/ci-logs/namcap.log
+          } 2>&1 | tee linux/target/ci-logs/arch-package.log
+          if grep -Eq '(^|[[:space:]])E:' linux/target/ci-logs/namcap.log; then
+            echo 'namcap reported a packaging error' >&2
+            exit 1
+          fi
+
+      - name: Upload Arch diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arch-package-verification-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            linux/target/ci-logs/
+            linux/target/dist/
+            linux/packaging/arch/*.pkg.tar.*

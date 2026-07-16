@@ -33,6 +33,13 @@ public struct CodexAppServerClient: UsageFetching {
         self.startupWriteDelay = startupWriteDelay
     }
 
+    static func appServerClientVersion(bundleVersion: String?) -> String {
+        guard let bundleVersion, !bundleVersion.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return "development"
+        }
+        return bundleVersion
+    }
+
     public func fetchUsageSnapshot() async throws -> UsageSnapshot {
         let worker = Task.detached(priority: .utility) {
             try Self.fetchSynchronously(
@@ -173,7 +180,9 @@ public struct CodexAppServerClient: UsageFetching {
                 "clientInfo": [
                     "name": "codex-usage-bar",
                     "title": "Codex Usage Bar",
-                    "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+                    "version": appServerClientVersion(
+                        bundleVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                    )
                 ],
                 "capabilities": [
                     "experimentalApi": true,
@@ -621,6 +630,7 @@ private final class AppServerResponseCollector: @unchecked Sendable {
             resolvedResponseIDs.insert(id)
             if let error = object["error"] {
                 if id == 3 {
+                    rateLimits = .failedOptionalRequest()
                     rateLimitsResolved = true
                 } else {
                     recordError(Self.describeError(error))
@@ -640,8 +650,13 @@ private final class AppServerResponseCollector: @unchecked Sendable {
                 usage = try UsageDecoding.decodeUsageResult(from: result)
             case 3:
                 // Rate limits are optional across CLI versions. A response resolves the
-                // optional request even when that version's shape is not understood.
-                rateLimits = try? UsageDecoding.decodeRateLimitsResult(from: result)
+                // optional request even when that version's shape is not understood, but
+                // preserve that distinction as a nonfatal data-quality warning.
+                do {
+                    rateLimits = try UsageDecoding.decodeRateLimitsResult(from: result)
+                } catch {
+                    rateLimits = .malformedOuterResponse()
+                }
                 rateLimitsResolved = true
             default:
                 break
@@ -914,102 +929,5 @@ private final class FileHandleDrainer: @unchecked Sendable {
             try? handle.close()
         }
         _ = waitForCompletion(timeout: timeout)
-    }
-}
-
-private final class BoundedDataCapture: @unchecked Sendable {
-    private let maxBytes: Int
-    private let lock = NSLock()
-    private var data = Data()
-    private var truncated = false
-
-    init(maxBytes: Int) {
-        self.maxBytes = max(0, maxBytes)
-    }
-
-    func append(_ incoming: Data) {
-        lock.withLock {
-            let remaining = max(0, maxBytes - data.count)
-            if remaining > 0 {
-                data.append(incoming.prefix(remaining))
-            }
-            if incoming.count > remaining {
-                truncated = true
-            }
-        }
-    }
-
-    var diagnostic: String? {
-        lock.withLock {
-            guard !data.isEmpty else { return nil }
-            let suffix = truncated ? " [truncated]" : ""
-            let message = DiagnosticSanitizer.clean(String(decoding: data, as: UTF8.self))
-            guard !message.isEmpty else { return truncated ? "[truncated]" : nil }
-            return message + suffix
-        }
-    }
-}
-
-private enum DiagnosticSanitizer {
-    static func clean(
-        _ input: String,
-        maxCharacters: Int = 512,
-        maxUTF8Bytes: Int = 2 * 1024
-    ) -> String {
-        let characterLimit = max(0, maxCharacters)
-        let byteLimit = max(0, maxUTF8Bytes)
-        guard characterLimit > 0, byteLimit > 0 else { return "" }
-
-        var sanitized = ""
-        sanitized.reserveCapacity(min(input.utf8.count, byteLimit))
-        var utf8Bytes = 0
-        var previousWasSpace = false
-
-        for scalar in input.unicodeScalars {
-            let isControl = CharacterSet.controlCharacters.contains(scalar)
-            let isWhitespace = CharacterSet.whitespacesAndNewlines.contains(scalar)
-            let scalarToAppend: Unicode.Scalar?
-            if isControl || isWhitespace {
-                if !previousWasSpace && !sanitized.isEmpty {
-                    scalarToAppend = " "
-                } else {
-                    scalarToAppend = nil
-                }
-                previousWasSpace = true
-            } else {
-                scalarToAppend = scalar
-                previousWasSpace = false
-            }
-
-            guard let scalarToAppend else { continue }
-            let scalarBytes = scalarToAppend.utf8ByteCount
-            if utf8Bytes > byteLimit - scalarBytes {
-                break
-            }
-            sanitized.unicodeScalars.append(scalarToAppend)
-            utf8Bytes += scalarBytes
-        }
-
-        let presentationBounded = String(sanitized.prefix(characterLimit))
-        return presentationBounded.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-private extension Unicode.Scalar {
-    var utf8ByteCount: Int {
-        switch value {
-        case 0 ... 0x7f: 1
-        case 0x80 ... 0x7ff: 2
-        case 0x800 ... 0xffff: 3
-        default: 4
-        }
-    }
-}
-
-private extension NSLock {
-    func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try body()
     }
 }

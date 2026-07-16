@@ -1,11 +1,16 @@
 PREFIX ?= /usr/local
 DESTDIR ?=
+PYTHON ?= python3
 APP_ID := io.github.conjfrnk.CodexUsageBar
-VERSION := 0.1.0
+VERSION_FILE ?= ../VERSION
+VERSION := $(strip $(shell cat "$(VERSION_FILE)" 2>/dev/null))
 DIST_NAME := codex-usage-bar-$(VERSION)
-LICENSE_FILE := $(if $(wildcard LICENSE),LICENSE,../LICENSE)
+LICENSE_FILE := ../LICENSE
+SOURCE_DATE_EPOCH ?= 0
 
-.PHONY: build check test visual-test visual-test-display run install uninstall dist arch-package clean
+.PHONY: build check test verify version-check visual-test visual-test-display run \
+	install uninstall dist dist-reproducible package-metadata-check package-test \
+	arch-package clean distclean
 
 build:
 	cargo build --release --locked
@@ -17,6 +22,27 @@ check:
 
 test:
 	cargo test --all-targets --locked
+
+version-check:
+	@if test -f ../scripts/check-version.sh; then \
+		/bin/bash ../scripts/check-version.sh; \
+	else \
+		version_lines="$$(awk 'END { print NR + 0 }' ../VERSION)"; \
+		canonical_version="$$(cat ../VERSION)"; \
+		manifest_version="$$(awk -F '"' '/^version = / { print $$2; exit }' Cargo.toml)"; \
+		test "$$version_lines" -eq 1 \
+			&& printf '%s\n' "$$canonical_version" \
+				| grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' \
+			&& test "$$manifest_version" = "$$canonical_version" || { \
+			echo "Cargo.toml does not match ../VERSION" >&2; exit 1; \
+		}; \
+	fi
+
+verify: version-check
+	$(MAKE) check
+	$(MAKE) test
+	$(MAKE) package-test
+	$(MAKE) visual-test
 
 visual-test: build
 	@command -v xvfb-run >/dev/null || { \
@@ -91,18 +117,35 @@ uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/share/doc/codex-usage-bar/waybar-style.css"
 	rm -f "$(DESTDIR)$(PREFIX)/share/licenses/codex-usage-bar/LICENSE"
 
-dist:
-	rm -rf "target/dist/$(DIST_NAME)"
-	mkdir -p "target/dist/$(DIST_NAME)"
-	cp Cargo.toml Cargo.lock Makefile README.md "target/dist/$(DIST_NAME)/"
-	cp "$(LICENSE_FILE)" "target/dist/$(DIST_NAME)/LICENSE"
-	cp -R src data "target/dist/$(DIST_NAME)/"
-	tar -C target/dist -czf "target/dist/$(DIST_NAME).tar.gz" "$(DIST_NAME)"
+dist: version-check
+	@test -n "$(VERSION)" || { echo "VERSION is empty" >&2; exit 1; }
+	@mkdir -p target/dist
+	$(PYTHON) tests/create-dist.py \
+		--output "target/dist/$(DIST_NAME).tar.gz" \
+		--epoch "$(SOURCE_DATE_EPOCH)"
+	@cd target/dist && b2sum "$(DIST_NAME).tar.gz" > "$(DIST_NAME).tar.gz.b2"
 
-arch-package: dist
+dist-reproducible:
+	@/bin/bash tests/check-dist-reproducible.sh
+
+package-metadata-check: dist
+	@/bin/bash tests/validate-package-metadata.sh "target/dist/$(DIST_NAME).tar.gz"
+
+package-test: build
+	@$(MAKE) dist-reproducible
+	@$(MAKE) package-metadata-check
+	@/bin/bash tests/package-smoke.sh
+
+arch-package: version-check dist
 	cp "target/dist/$(DIST_NAME).tar.gz" packaging/arch/
-	cd packaging/arch && makepkg -f
+	cd packaging/arch && makepkg --cleanbuild --force --noconfirm
 	rm -f "packaging/arch/$(DIST_NAME).tar.gz"
 
+# Cleanup is intentionally explicit and is never part of verify or CI.
 clean:
 	cargo clean
+
+distclean:
+	rm -rf target packaging/arch/src packaging/arch/pkg
+	rm -f packaging/arch/codex-usage-bar-*.tar.gz \
+		packaging/arch/codex-usage-bar-*.pkg.tar.*

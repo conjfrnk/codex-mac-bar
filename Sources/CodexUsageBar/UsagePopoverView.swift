@@ -19,8 +19,6 @@ struct UsagePresentationClock {
         Self(fixedDate: date, calendar: calendar, locale: locale)
     }
 
-    var scheduleStart: Date { fixedDate ?? Date() }
-
     func resolve(_ timelineDate: Date) -> Date {
         fixedDate ?? timelineDate
     }
@@ -56,6 +54,8 @@ struct UsagePopoverView: View {
     @State private var dailyHistoryPage = 0
     private let viewportSize: NSSize
     private let clock: UsagePresentationClock
+    private let presentationTicker: UsagePresentationTicker
+    private let onLocateCodex: () -> Void
 
     init(
         viewModel: UsageViewModel,
@@ -63,7 +63,9 @@ struct UsagePopoverView: View {
         preferences: UserDefaults = .standard,
         initialTimeframe: UsageTimeframe = .thirty,
         launchAtLoginController: LaunchAtLoginController? = nil,
-        clock: UsagePresentationClock = .live()
+        clock: UsagePresentationClock = .live(),
+        presentationTicker: UsagePresentationTicker? = nil,
+        onLocateCodex: @escaping () -> Void = {}
     ) {
         self.viewModel = viewModel
         self.viewportSize = viewportSize
@@ -76,6 +78,10 @@ struct UsagePopoverView: View {
         _launchAtLogin = StateObject(
             wrappedValue: launchAtLoginController ?? LaunchAtLoginController()
         )
+        self.presentationTicker = presentationTicker ?? UsagePresentationTicker(
+            now: { clock.fixedDate ?? Date() }
+        )
+        self.onLocateCodex = onLocateCodex
     }
 
     var body: some View {
@@ -89,10 +95,22 @@ struct UsagePopoverView: View {
         let selectionDate = clock.resolve(Date())
         ZStack {
             MenuBackdrop()
-            ScrollView(showsIndicators: false) {
-                content(now: selectionDate)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 16)
+            VStack(spacing: 0) {
+                ScrollView(showsIndicators: true) {
+                    content(now: selectionDate)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 16)
+                }
+
+                UsagePopoverFooter(
+                    launchAtLogin: launchAtLogin,
+                    presentationTicker: presentationTicker,
+                    lastSuccessfulRefresh: viewModel.snapshot?.fetchedAt,
+                    showsLocateCodex: viewModel.lastError != nil,
+                    onRefresh: viewModel.refresh,
+                    onLocateCodex: onLocateCodex,
+                    onQuit: { NSApp.terminate(nil) }
+                )
             }
         }
         .frame(width: viewportSize.width, height: viewportSize.height)
@@ -125,11 +143,6 @@ struct UsagePopoverView: View {
         VStack(alignment: .leading, spacing: 12) {
             header(title: "Usage", value: "...", accessibilityValue: "Loading usage")
             InfoRow(title: "Status", value: "Fetching account usage")
-            DividerLine()
-            launchAtLoginSection
-            MenuActionRow(title: "Quit", systemImage: "power") {
-                NSApp.terminate(nil)
-            }
         }
     }
 
@@ -137,18 +150,10 @@ struct UsagePopoverView: View {
         VStack(alignment: .leading, spacing: 12) {
             header(title: "Usage", value: "?", accessibilityValue: "Usage unavailable")
             Text(viewModel.lastError ?? "Codex usage could not be loaded.")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            DividerLine()
-            MenuActionRow(title: "Retry", systemImage: "arrow.clockwise") {
-                viewModel.refresh()
-            }
-            launchAtLoginSection
-            MenuActionRow(title: "Quit", systemImage: "power") {
-                NSApp.terminate(nil)
-            }
         }
     }
 
@@ -185,7 +190,7 @@ struct UsagePopoverView: View {
                     .padding(.top, 12)
             } else if case .loading = viewModel.state {
                 Text("Refreshing usage…")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.top, 8)
                     .accessibilityLabel("Refreshing usage")
@@ -259,30 +264,18 @@ struct UsagePopoverView: View {
             DividerLine()
 
             liveRateLimitSection(snapshot)
-
-            liveRefreshFooter
-
-            DividerLine()
-
-            actionSection
         }
         .onChange(of: historyPageCount) { pageCount in
             dailyHistoryPage = min(max(dailyHistoryPage, 0), max(pageCount - 1, 0))
         }
     }
 
-    /// Only countdown/reset text needs a 30-second cadence. Keeping TimelineView
-    /// below the expensive range/chart/history selection avoids sorting a maximal
-    /// app-server payload on every countdown tick during a long menu session.
+    /// Only countdown/reset text observes the shared presentation ticker. Keeping
+    /// that observation below expensive range/chart/history selection avoids
+    /// sorting a maximal app-server payload on every presentation tick.
     private func liveRateLimitSection(_ snapshot: UsageSnapshot) -> some View {
-        TimelineView(.periodic(from: clock.scheduleStart, by: 30)) { context in
-            rateLimitSection(snapshot, now: clock.resolve(context.date))
-        }
-    }
-
-    private var liveRefreshFooter: some View {
-        TimelineView(.periodic(from: clock.scheduleStart, by: 30)) { context in
-            refreshFooter(now: clock.resolve(context.date))
+        LivePresentationValue(ticker: presentationTicker) { date in
+            rateLimitSection(snapshot, now: clock.resolve(date))
         }
     }
 
@@ -295,11 +288,11 @@ struct UsagePopoverView: View {
             CodexUsageLogo()
                 .frame(width: 34, height: 34)
             Text(title)
-                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .font(.system(.title3, design: .rounded, weight: .bold))
                 .lineLimit(1)
             Spacer(minLength: 8)
             Text(value)
-                .font(.system(size: 32, weight: .bold, design: .rounded))
+                .font(.system(.largeTitle, design: .rounded, weight: .bold))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
@@ -399,7 +392,7 @@ struct UsagePopoverView: View {
                 SectionTitle(activityTitle)
                 Spacer()
                 Text(activityStatus)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
@@ -420,7 +413,7 @@ struct UsagePopoverView: View {
                         ? "Daily totals exceed the supported range"
                         : "Daily data unavailable"
                 )
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 150)
                     .accessibilityLabel(
@@ -476,57 +469,6 @@ struct UsagePopoverView: View {
         }
     }
 
-    private func refreshFooter(now: Date) -> some View {
-        Text("Last successful refresh \(lastUpdatedValue(now: now))")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.top, 14)
-    }
-
-    private var actionSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            MenuActionRow(title: "Refresh", systemImage: "arrow.clockwise") {
-                viewModel.refresh()
-            }
-
-            launchAtLoginSection
-
-            MenuActionRow(title: "Quit", systemImage: "power") {
-                NSApp.terminate(nil)
-            }
-        }
-    }
-
-    private var launchAtLoginSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            LaunchAtLoginRow(
-                isOn: Binding(
-                    get: { launchAtLogin.isEnabled },
-                    set: { launchAtLogin.setEnabled($0) }
-                ),
-                isEnabled: launchAtLogin.canToggle
-            )
-
-            if let statusText = launchAtLogin.statusText {
-                Text(statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-                    .padding(.leading, 28)
-                    .padding(.vertical, 4)
-            }
-        }
-    }
-
-    private func lastUpdatedValue(now: Date) -> String {
-        guard let fetchedAt = viewModel.snapshot?.fetchedAt else {
-            return "never"
-        }
-        return Self.elapsedText(since: fetchedAt, now: now)
-    }
-
     nonisolated static func elapsedText(since date: Date, now: Date) -> String {
         let interval = now.timeIntervalSince(date)
         guard interval.isFinite else { return "unknown" }
@@ -576,9 +518,9 @@ private struct StaleSnapshotBanner: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
             }
-                .font(.system(size: 12, weight: .bold))
+                .font(.caption.weight(.bold))
             Text("Refresh failed: \(message)")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
                 .textSelection(.enabled)
@@ -672,7 +614,7 @@ private struct TimeframeTabs: View {
                     selection = timeframe
                 } label: {
                     Text(timeframe.shortTitle)
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .font(.system(.callout, design: .rounded, weight: .bold))
                         .lineLimit(1)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
@@ -690,6 +632,8 @@ private struct TimeframeTabs: View {
 }
 
 private struct InfoRow: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let title: String
     let value: String
     let accessibilityValueOverride: String?
@@ -701,22 +645,42 @@ private struct InfoRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(title)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 10)
-            Text(value)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.trailing)
-                .lineLimit(2)
-                .minimumScaleFactor(0.76)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 2) {
+                    titleText
+                    valueText
+                        .multilineTextAlignment(.leading)
+                }
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    titleText
+                    Spacer(minLength: 10)
+                    valueText
+                        .multilineTextAlignment(.trailing)
+                }
+            }
         }
         .padding(.vertical, 3)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
         .accessibilityValue(accessibilityValueOverride ?? value)
+    }
+
+    private var titleText: some View {
+        Text(title)
+            .font(.body.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var valueText: some View {
+        Text(value)
+            .font(.body.weight(.semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(3)
+            .minimumScaleFactor(0.76)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -748,12 +712,12 @@ private struct LimitInfoRows: View {
                         .accessibilityValue(RateLimitPresentation.percent(window.usedPercent))
                 } else {
                     Text("Usage unavailable")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("\(title) usage unavailable")
                 }
                 Text(reset)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
@@ -797,12 +761,12 @@ private struct IndividualLimitInfoRows: View {
                         .accessibilityValue(RateLimitPresentation.percent(limit.usedPercent))
                 } else {
                     Text("Usage unavailable")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("Individual usage unavailable")
                 }
                 Text(reset)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
@@ -819,148 +783,6 @@ private struct IndividualLimitInfoRows: View {
     }
 }
 
-enum RateLimitPresentation {
-    static func hasDataQualityIssues(_ response: AccountRateLimitsResponse?) -> Bool {
-        response?.decodingIssues.isEmpty == false
-    }
-
-    static func resetDescription(
-        timestamp: Double?,
-        now: Date,
-        calendar: Calendar,
-        locale: Locale
-    ) -> String {
-        guard now.timeIntervalSinceReferenceDate.isFinite,
-              let date = resetDate(timestamp: timestamp)
-        else { return "reset unavailable" }
-        let interval = date.timeIntervalSince(now)
-        if abs(interval) < 1 { return "resets now" }
-        let relative = relativeReset(
-            timestamp: timestamp,
-            now: now,
-            calendar: calendar,
-            locale: locale
-        )
-        guard relative != "n/a" else { return "reset unavailable" }
-        // A stale-but-still-open menu can cross the reset boundary. Keep the
-        // surrounding verb in the same tense as the formatter's relative value.
-        if interval < 0, relative != "now" {
-            return "reset \(relative)"
-        }
-        return "resets \(relative)"
-    }
-
-    static func percent(_ value: Double?) -> String {
-        guard let value, value.isFinite, value >= 0 else { return "n/a" }
-        return UsageFormatting.percent(value)
-    }
-
-    static func progress(_ value: Double?) -> Double {
-        guard let value = validPercent(value) else { return 0 }
-        return min(max(value, 0), 100)
-    }
-
-    static func validPercent(_ value: Double?) -> Double? {
-        guard let value, value.isFinite, value >= 0 else { return nil }
-        return value
-    }
-
-    static func credits(_ snapshot: CreditsSnapshot) -> String {
-        if snapshot.unlimited == true { return "Unlimited" }
-        if snapshot.hasCredits == false { return "None" }
-        if let balance = snapshot.balance {
-            let sanitizedBalance = amount(balance)
-            if sanitizedBalance != "n/a" { return sanitizedBalance }
-        }
-        if snapshot.hasCredits == true { return "Available" }
-        let remaining = snapshot.remaining.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let total = snapshot.total.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let used = snapshot.used.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        if let remaining, let total, remaining <= total,
-           let remainingText = finiteNonnegativeDecimal(remaining),
-           let totalText = finiteNonnegativeDecimal(total) {
-            return "\(remainingText) / \(totalText) remaining"
-        }
-        if let remaining, total == nil,
-           let remainingText = finiteNonnegativeDecimal(remaining) {
-            return "\(remainingText) remaining"
-        }
-        if let used, let total, used <= total,
-           let usedText = finiteNonnegativeDecimal(used),
-           let totalText = finiteNonnegativeDecimal(total) {
-            return "\(usedText) / \(totalText) used"
-        }
-        if let used, let usedText = finiteNonnegativeDecimal(used) {
-            return "\(usedText) used"
-        }
-        if let remaining, let remainingText = finiteNonnegativeDecimal(remaining) {
-            // Preserve the independently valid field without presenting an
-            // inconsistent remaining/total pair as meaningful.
-            return "\(remainingText) remaining"
-        }
-        return "n/a"
-    }
-
-    private static func finiteNonnegativeDecimal(_ value: Double?) -> String? {
-        guard let value, value.isFinite, value >= 0 else { return nil }
-        if value < Double(Int64.max), value.rounded(.towardZero) == value {
-            return String(Int64(value))
-        }
-        return String(
-            format: "%.15g",
-            locale: Locale(identifier: "en_US_POSIX"),
-            value
-        )
-    }
-
-    static func amount(_ value: String?) -> String {
-        text(value)
-    }
-
-    static func limitReachedStatus(_ value: String?) -> String? {
-        guard value != nil else { return nil }
-        let sanitized = text(value)
-        return sanitized == "n/a" ? "Reported" : sanitized
-    }
-
-    static func text(_ value: String?) -> String {
-        guard let value else { return "n/a" }
-        return BoundedDisplayText.clean(
-            value,
-            maximumUnicodeScalars: 64,
-            emptyFallback: "n/a"
-        )
-    }
-
-    static func windowDuration(minutes: Int?) -> String {
-        UsageFormatting.windowDuration(minutes: minutes)
-    }
-
-    static func relativeReset(
-        timestamp: Double?,
-        now: Date,
-        calendar: Calendar,
-        locale: Locale
-    ) -> String {
-        guard now.timeIntervalSinceReferenceDate.isFinite else { return "n/a" }
-        guard let date = resetDate(timestamp: timestamp) else { return "n/a" }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.calendar = calendar
-        formatter.locale = locale
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: now)
-    }
-
-    private static func resetDate(timestamp: Double?) -> Date? {
-        // The app-server contract defines Unix seconds. Do not silently reinterpret
-        // large but valid values as milliseconds.
-        guard let seconds = timestamp, seconds.isFinite else { return nil }
-        // Foundation formatters are not useful outside the civil Date range.
-        guard (0...253_402_300_799).contains(seconds) else { return nil }
-        return Date(timeIntervalSince1970: seconds)
-    }
-}
-
 private struct DailyUsageRow: View {
     let bucket: DailyUsageBucket
     let locale: Locale
@@ -968,18 +790,18 @@ private struct DailyUsageRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Text(bucket.startDate)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .font(.system(.body, design: .monospaced, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
             Spacer()
             Image(systemName: "chart.line.uptrend.xyaxis")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.callout.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             Text(UsageFormatting.fullTokens(bucket.tokens, locale: locale))
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .font(.system(.body, design: .monospaced, weight: .semibold))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
@@ -993,7 +815,7 @@ private struct DailyUsageRow: View {
 }
 
 /// A minimal, quiet pager for the paginated daily-history section: "Page X of Y"
-/// flanked by small chevron buttons. Styled as a dimmer sibling of `MenuActionRow` —
+/// flanked by small chevron buttons. Styled as a quiet sibling of the footer actions —
 /// same plain-button + SF Symbol language, but secondary-toned, compact, and centered
 /// so it reads as a footnote under the row list rather than a new call to action.
 /// Direction convention: page 0 is the newest rows. The left/back chevron moves
@@ -1016,7 +838,7 @@ private struct DailyHistoryPager: View {
             Spacer(minLength: 0)
 
             Text("Page \(page + 1) of \(pageCount)")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .font(.system(.callout, design: .rounded, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
                 .lineLimit(1)
@@ -1037,7 +859,7 @@ private struct DailyHistoryPager: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .opacity(isEnabled ? 1 : 0.32)
                 .frame(width: 22, height: 22)
@@ -1050,43 +872,6 @@ private struct DailyHistoryPager: View {
     }
 }
 
-private struct LaunchAtLoginRow: View {
-    @Binding var isOn: Bool
-    let isEnabled: Bool
-
-    var body: some View {
-        Toggle("Open at Login", isOn: $isOn)
-            .toggleStyle(.checkbox)
-            .font(.system(size: 16, weight: .semibold))
-            .padding(.vertical, 7)
-            .disabled(!isEnabled)
-    }
-}
-
-private struct MenuActionRow: View {
-    let title: String
-    let systemImage: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 18)
-                    .accessibilityHidden(true)
-                Text(title)
-                    .font(.system(size: 16, weight: .semibold))
-                Spacer()
-            }
-            .contentShape(Rectangle())
-            .padding(.vertical, 7)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-    }
-}
-
 private struct SectionTitle: View {
     let title: String
 
@@ -1096,7 +881,7 @@ private struct SectionTitle: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 14, weight: .bold))
+            .font(.headline)
             .foregroundStyle(.secondary)
             .accessibilityAddTraits(.isHeader)
     }

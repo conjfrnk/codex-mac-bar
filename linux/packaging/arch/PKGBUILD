@@ -9,26 +9,27 @@ license=('MIT')
 depends=('gtk4>=4.10' 'dbus')
 makedepends=('cargo')
 optdepends=('gnome-shell-extension-appindicator: tray icon support under GNOME Shell')
-source=("$pkgname-$pkgver.tar.gz")
-b2sums=('SKIP')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/conjfrnk/codex-mac-bar/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+b2sums=('bece5cff65a0fd41fe492fbf34d5bfbc2ec3716b87b32e971ba86eef33fa8dc12cb0168f510886add2b058ee4ccfcae7546fc3d455b19049eedf97e8661f4cf3')
 
 prepare() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$pkgver/linux"
+  make version-check
   cargo fetch --locked
 }
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$pkgver/linux"
   cargo build --release --frozen
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$pkgver/linux"
   cargo test --all-targets --frozen
 }
 
 package() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$pkgver/linux"
   install -Dm755 target/release/codex-usage-bar "$pkgdir/usr/bin/codex-usage-bar"
   install -Dm644 data/io.github.conjfrnk.CodexUsageBar.desktop \
     "$pkgdir/usr/share/applications/io.github.conjfrnk.CodexUsageBar.desktop"
@@ -38,5 +39,5 @@ package() {
     "$pkgdir/usr/share/doc/$pkgname/waybar-module.jsonc"
   install -Dm644 data/waybar-style.css \
     "$pkgdir/usr/share/doc/$pkgname/waybar-style.css"
-  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 ../LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

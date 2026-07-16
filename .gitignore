@@ -1,12 +1,18 @@
 # Swift and Xcode build output
 .build/
 linux/target/
+linux/packaging/arch/codex-usage-bar-*.tar.gz
+linux/packaging/arch/codex-usage-bar-*.pkg.tar.*
+linux/packaging/arch/src/
+linux/packaging/arch/pkg/
 .swiftpm/
 DerivedData/
 xcuserdata/
 *.xcuserstate
 *.profraw
 *.profdata
+__pycache__/
+*.py[cod]
 
 # Local tooling and editor state
 .claude/

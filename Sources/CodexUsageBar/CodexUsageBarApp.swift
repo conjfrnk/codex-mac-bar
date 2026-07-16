@@ -5,12 +5,19 @@ import Darwin
 enum CodexUsageBarApp {
     @MainActor
     static func main() {
+        // Apply a user-selected executable before any headless command or the
+        // app's first refresh constructs an app-server request.
+        UsagePreferences.applyPersistedCodexExecutable()
+
         do {
             if try UsagePopoverRenderer.runIfRequested() {
                 return
             }
+            if try UsageHealthCheck.runIfRequested() {
+                return
+            }
         } catch {
-            fputs("FAIL \(error)\n", stderr)
+            fputs("\(UsageHealthCheck.failureLine(for: error))\n", stderr)
             exit(1)
         }
 

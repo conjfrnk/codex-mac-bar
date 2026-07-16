@@ -7,6 +7,8 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 
+use crate::text_safety::is_unsafe_format_character;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DailyUsageBucket {
     pub start_date: String,
@@ -304,22 +306,34 @@ impl AccountRateLimitsResponse {
         }
     }
 
+    pub fn failed_optional_request() -> Self {
+        Self {
+            decoding_issues: vec!["response: optional request failed".into()],
+            ..Self::default()
+        }
+    }
+
     pub fn preferred_codex_limit(&self) -> Option<&RateLimitSnapshot> {
         if let Some(limit) = self
             .rate_limits_by_limit_id
             .as_ref()
             .and_then(|limits| limits.get("codex"))
+            .filter(|limit| rate_limit_snapshot_has_meaningful_data(limit))
         {
             return Some(limit);
         }
         if let Some(limits) = self.rate_limits_by_limit_id.as_ref() {
             for key in sorted_keys(limits) {
-                if limits[key].limit_id.as_deref() == Some("codex") {
+                if limits[key].limit_id.as_deref() == Some("codex")
+                    && rate_limit_snapshot_has_meaningful_data(&limits[key])
+                {
                     return Some(&limits[key]);
                 }
             }
         }
-        self.rate_limits.as_ref()
+        self.rate_limits
+            .as_ref()
+            .filter(|limit| rate_limit_snapshot_has_meaningful_data(limit))
     }
 
     pub fn has_meaningful_data(&self) -> bool {
@@ -333,27 +347,28 @@ impl AccountRateLimitsResponse {
 fn rate_limit_snapshot_has_meaningful_data(limit: &RateLimitSnapshot) -> bool {
     let credits = limit.credits.as_ref().is_some_and(|credits| {
         credits.has_credits.is_some()
-            || credits.unlimited.is_some()
+            || credits.unlimited == Some(true)
             || credits
                 .balance
                 .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(|value| has_displayable_text(value))
             || credits.remaining.is_some()
-            || credits.total.is_some()
             || credits.used.is_some()
     });
     let individual = limit.individual_limit.as_ref().is_some_and(|individual| {
         individual
             .limit
             .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_some_and(|value| has_displayable_text(value))
             || individual
                 .used
                 .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(|value| has_displayable_text(value))
             || individual.remaining_percent.is_some()
             || individual.used_percent.is_some()
-            || individual.resets_at.is_some()
+            || individual
+                .resets_at
+                .is_some_and(is_presentable_unix_timestamp)
     });
     limit.primary.is_some()
         || limit.secondary.is_some()
@@ -362,11 +377,21 @@ fn rate_limit_snapshot_has_meaningful_data(limit: &RateLimitSnapshot) -> bool {
         || limit
             .plan_type
             .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_some_and(|value| has_displayable_text(value))
         || limit
             .rate_limit_reached_type
             .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_some_and(|value| has_displayable_text(value))
+}
+
+fn is_presentable_unix_timestamp(value: f64) -> bool {
+    value.is_finite() && (0.0..=253_402_300_799.0).contains(&value)
+}
+
+fn has_displayable_text(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| !character.is_whitespace() && !is_unsafe_format_character(character))
 }
 
 #[derive(Clone, Debug)]
@@ -714,6 +739,131 @@ fn sorted_keys<T>(map: &HashMap<String, T>) -> Vec<&String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContractCorpus {
+        schema_version: u32,
+        rate_limit_cases: Vec<ContractCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ContractCase {
+        name: String,
+        source: ContractSource,
+        expected: ContractExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ContractSource {
+        kind: String,
+        value: serde_json::Value,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContractExpected {
+        selected_limit_id: Option<String>,
+        has_meaningful_data: bool,
+        primary_used_percent: Option<f64>,
+        primary_window_duration_mins: Option<i64>,
+        individual_used_percent: Option<f64>,
+        plan_type: Option<String>,
+        reset_credit_count: Option<i64>,
+        warning_paths: Vec<String>,
+        exact_warnings: Option<Vec<String>>,
+    }
+
+    #[test]
+    fn shared_rate_limit_contract_corpus() {
+        let corpus: ContractCorpus = serde_json::from_str(include_str!(
+            "../../Fixtures/Protocol/rate-limit-contracts.json"
+        ))
+        .unwrap();
+        assert_eq!(corpus.schema_version, 1);
+        assert!(!corpus.rate_limit_cases.is_empty());
+
+        for fixture in corpus.rate_limit_cases {
+            let response = match fixture.source.kind.as_str() {
+                "result" => {
+                    serde_json::from_value::<AccountRateLimitsResponse>(fixture.source.value)
+                        .unwrap_or_else(|_| AccountRateLimitsResponse::malformed_outer_response())
+                }
+                "jsonRpcError" => AccountRateLimitsResponse::failed_optional_request(),
+                kind => panic!("unknown source kind {kind} in {}", fixture.name),
+            };
+            let selected = response.preferred_codex_limit();
+            assert_eq!(
+                selected.and_then(|limit| limit.limit_id.as_deref()),
+                fixture.expected.selected_limit_id.as_deref(),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                response.has_meaningful_data(),
+                fixture.expected.has_meaningful_data,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                selected
+                    .and_then(|limit| limit.primary.as_ref())
+                    .map(|window| window.used_percent),
+                fixture.expected.primary_used_percent,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                selected
+                    .and_then(|limit| limit.primary.as_ref())
+                    .and_then(|window| window.window_duration_mins),
+                fixture.expected.primary_window_duration_mins,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                selected
+                    .and_then(|limit| limit.individual_limit.as_ref())
+                    .and_then(|limit| limit.used_percent),
+                fixture.expected.individual_used_percent,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                selected.and_then(|limit| limit.plan_type.as_deref()),
+                fixture.expected.plan_type.as_deref(),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                response
+                    .rate_limit_reset_credits
+                    .as_ref()
+                    .map(|credits| credits.available_count),
+                fixture.expected.reset_credit_count,
+                "{}",
+                fixture.name
+            );
+            let warning_paths: Vec<_> = response
+                .decoding_issues
+                .iter()
+                .map(|issue| {
+                    issue
+                        .split_once(':')
+                        .map_or(issue.as_str(), |(path, _)| path)
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(
+                warning_paths, fixture.expected.warning_paths,
+                "{}",
+                fixture.name
+            );
+            if let Some(exact_warnings) = fixture.expected.exact_warnings {
+                assert_eq!(response.decoding_issues, exact_warnings, "{}", fixture.name);
+            }
+        }
+    }
 
     #[test]
     fn decodes_flexible_token_counts() {

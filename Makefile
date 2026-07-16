@@ -1,7 +1,27 @@
-.PHONY: build test coverage visual-test run app install
+.PHONY: build test strict-concurrency macos-smoke-check coverage visual-test \
+	run app install check-version verify verify-macos verify-linux clean distclean
 
 build:
 	swift build
+
+check-version:
+	@/bin/bash scripts/check-version.sh
+
+verify:
+	@set -e; case "$$(uname -s)" in \
+		Darwin) $(MAKE) verify-macos ;; \
+		Linux) $(MAKE) verify-linux ;; \
+		*) echo "verify is supported on macOS and Linux" >&2; exit 1 ;; \
+	esac
+
+verify-macos: check-version
+	$(MAKE) test
+	$(MAKE) strict-concurrency
+	$(MAKE) macos-smoke-check
+	$(MAKE) visual-test
+
+verify-linux: check-version
+	$(MAKE) -C linux verify
 
 test:
 	@set -e; if [ "$$(uname -s)" = Darwin ]; then \
@@ -35,6 +55,24 @@ test:
 	fi
 	@exit_code=0; .build/debug/CodexUsageChecks --unknown-check-option >/dev/null 2>&1 || exit_code=$$?; \
 		test "$$exit_code" -eq 64
+
+strict-concurrency:
+	@set -e; test "$$(uname -s)" = Darwin || { \
+		echo "strict-concurrency requires the macOS Swift targets" >&2; exit 1; \
+	}; \
+	developer_dir="$$(xcode-select -p)"; \
+	export DEVELOPER_DIR="$$developer_dir"; \
+	xcrun swift build --scratch-path .build/strict-concurrency --build-tests \
+		--disable-xctest --enable-swift-testing \
+		-Xswiftc -strict-concurrency=complete \
+		-Xswiftc -warnings-as-errors
+
+macos-smoke-check:
+	@set -e; test "$$(uname -s)" = Darwin || { \
+		echo "macos-smoke-check requires macOS" >&2; exit 1; \
+	}
+	swift build --product CodexUsageBar
+	@/bin/bash scripts/smoke-macos-check.sh
 
 coverage:
 	$(MAKE) test
@@ -124,6 +162,7 @@ visual-test:
 		.build/popover-snapshots/state-partial.png \
 		.build/popover-snapshots/state-malformed-rate.png \
 		.build/popover-snapshots/state-login-approval.png \
+		.build/popover-snapshots/state-accessibility-text.png \
 		.build/popover-snapshots/state-success-all.png \
 		.build/popover-snapshots/state-success-all-tall.png \
 		.build/popover-snapshots/state-success-thirty-tall.png \
@@ -150,6 +189,7 @@ visual-test:
 	.build/debug/CodexUsageBar --render-popover ".build/popover-snapshots/state-success-thirty-tall.png" --appearance light --timeframe thirty --fixture success --width 300 --height 1400
 	.build/debug/CodexUsageBar --render-popover ".build/popover-snapshots/state-malformed-rate.png" --appearance light --timeframe thirty --fixture malformed-rate --width 300 --height 1400
 	.build/debug/CodexUsageBar --render-popover ".build/popover-snapshots/state-login-approval.png" --appearance light --timeframe thirty --fixture login-approval --width 300 --height 1400
+	.build/debug/CodexUsageBar --render-popover ".build/popover-snapshots/state-accessibility-text.png" --appearance light --timeframe thirty --fixture success --text-size accessibility --width 300 --height 560
 	@if cmp -s ".build/popover-snapshots/popover-light.png" ".build/popover-snapshots/state-loading.png"; then echo "FAIL loading fixture matches success"; exit 1; fi
 	@if cmp -s ".build/popover-snapshots/popover-light.png" ".build/popover-snapshots/state-error.png"; then echo "FAIL error fixture matches success"; exit 1; fi
 	@if cmp -s ".build/popover-snapshots/popover-light.png" ".build/popover-snapshots/state-stale.png"; then echo "FAIL stale fixture matches success"; exit 1; fi
@@ -163,6 +203,7 @@ visual-test:
 	@if cmp -s ".build/popover-snapshots/state-success-all-tall.png" ".build/popover-snapshots/state-partial.png"; then echo "FAIL partial fixture matches success"; exit 1; fi
 	@if cmp -s ".build/popover-snapshots/state-success-thirty-tall.png" ".build/popover-snapshots/state-malformed-rate.png"; then echo "FAIL malformed-rate fixture matches success"; exit 1; fi
 	@if cmp -s ".build/popover-snapshots/state-success-thirty-tall.png" ".build/popover-snapshots/state-login-approval.png"; then echo "FAIL login-approval fixture matches success"; exit 1; fi
+	@if cmp -s ".build/popover-snapshots/popover-light.png" ".build/popover-snapshots/state-accessibility-text.png"; then echo "FAIL accessibility text fixture matches standard text"; exit 1; fi
 	@exit_code=0; .build/debug/CodexUsageBar --render-popover --appearance dark >/dev/null 2>&1 || exit_code=$$?; \
 		test "$$exit_code" -eq 1
 	@exit_code=0; .build/debug/CodexUsageBar --render-popover ".build/popover-snapshots/invalid.png" --width 260.5 >/dev/null 2>&1 || exit_code=$$?; \
@@ -173,10 +214,24 @@ visual-test:
 run: app
 	open ".build/Codex Usage Bar.app"
 
-app:
+app: check-version
 	./scripts/build-app.sh
 
-install:
+install: check-version
 	@set -e; home="$${HOME:?HOME must be set and nonempty for make install}"; \
 		APP_OUTPUT_DIR="$$home/Applications" ./scripts/build-app.sh; \
 		/usr/bin/open "$$home/Applications/Codex Usage Bar.app"
+
+# Cleanup is intentionally explicit and is never part of verify or CI.
+clean:
+	@set -e; case "$$(uname -s)" in \
+		Darwin) swift package clean ;; \
+		Linux) $(MAKE) -C linux clean ;; \
+		*) echo "clean is supported on macOS and Linux" >&2; exit 1 ;; \
+	esac
+
+distclean:
+	rm -rf .build .swiftpm linux/target \
+		linux/packaging/arch/src linux/packaging/arch/pkg
+	rm -f linux/packaging/arch/codex-usage-bar-*.tar.gz \
+		linux/packaging/arch/codex-usage-bar-*.pkg.tar.*

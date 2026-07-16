@@ -436,7 +436,12 @@ func rateLimitErrorIsBestEffort() throws {
     """
     let snapshot = try runFakeCodex(script: fakeCodexScript(rateLimitAction: action)).get()
     try expect(snapshot.sortedBuckets.map(\.tokens) == [7], "Expected usage from fake Codex CLI")
-    try expect(snapshot.rateLimits == nil, "Rate-limit error should not discard valid usage")
+    let rateLimits = try require(snapshot.rateLimits, "Expected a nonfatal rate-limit error warning")
+    try expect(!rateLimits.hasMeaningfulData, "Rate-limit error warning must not masquerade as data")
+    try expect(
+        rateLimits.decodingIssues == ["response: optional request failed"],
+        "Rate-limit error should preserve a bounded warning without discarding valid usage"
+    )
 }
 
 func malformedRateLimitIsBestEffort() throws {
@@ -447,7 +452,12 @@ func malformedRateLimitIsBestEffort() throws {
     """
     let snapshot = try runFakeCodex(script: fakeCodexScript(rateLimitAction: action)).get()
     try expect(snapshot.sortedBuckets.map(\.tokens) == [7], "Expected usage with malformed rate-limit response")
-    try expect(snapshot.rateLimits == nil, "Malformed rate-limit response should be ignored")
+    let rateLimits = try require(snapshot.rateLimits, "Expected a malformed rate-limit warning")
+    try expect(!rateLimits.hasMeaningfulData, "Malformed rate-limit warning must not masquerade as data")
+    try expect(
+        rateLimits.decodingIssues == ["response: malformed value"],
+        "Malformed rate-limit response should remain a bounded, nonfatal warning"
+    )
 }
 
 func missingRateLimitStillReturnsUsageAtTimeout() throws {

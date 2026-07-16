@@ -5,6 +5,7 @@ mod config;
 mod fixture;
 mod model;
 mod range;
+mod text_safety;
 mod tray;
 mod ui;
 

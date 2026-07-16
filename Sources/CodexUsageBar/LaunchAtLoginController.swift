@@ -16,6 +16,10 @@ protocol LaunchAtLoginServicing {
     func unregister() throws
 }
 
+protocol LaunchAtLoginSettingsOpening {
+    func openSystemSettingsLoginItems()
+}
+
 private struct SystemLaunchAtLoginService: LaunchAtLoginServicing {
     var status: LaunchAtLoginServiceStatus {
         switch SMAppService.mainApp.status {
@@ -41,6 +45,12 @@ private struct SystemLaunchAtLoginService: LaunchAtLoginServicing {
     }
 }
 
+private struct SystemLaunchAtLoginSettingsOpener: LaunchAtLoginSettingsOpening {
+    func openSystemSettingsLoginItems() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+}
+
 @MainActor
 final class LaunchAtLoginController: ObservableObject {
     enum State: Equatable {
@@ -53,6 +63,7 @@ final class LaunchAtLoginController: ObservableObject {
     @Published private(set) var state: State = .disabled
     @Published private(set) var operationError: String?
     private let service: any LaunchAtLoginServicing
+    private let settingsOpener: any LaunchAtLoginSettingsOpening
 
     var isEnabled: Bool {
         state == .enabled || state == .requiresApproval
@@ -61,6 +72,10 @@ final class LaunchAtLoginController: ObservableObject {
     var canToggle: Bool {
         if case .unavailable = state { return false }
         return true
+    }
+
+    var requiresApproval: Bool {
+        state == .requiresApproval
     }
 
     var statusText: String? {
@@ -77,9 +92,18 @@ final class LaunchAtLoginController: ObservableObject {
         }
     }
 
-    init(service: (any LaunchAtLoginServicing)? = nil) {
+    init(
+        service: (any LaunchAtLoginServicing)? = nil,
+        settingsOpener: (any LaunchAtLoginSettingsOpening)? = nil
+    ) {
         self.service = service ?? SystemLaunchAtLoginService()
+        self.settingsOpener = settingsOpener ?? SystemLaunchAtLoginSettingsOpener()
         refresh()
+    }
+
+    func openSystemSettingsLoginItems() {
+        guard requiresApproval else { return }
+        settingsOpener.openSystemSettingsLoginItems()
     }
 
     func refresh() {

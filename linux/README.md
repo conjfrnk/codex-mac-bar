@@ -21,7 +21,8 @@ The Linux app is independent of the macOS Swift target in the repository root. I
 Install build dependencies:
 
 ```sh
-sudo pacman -S --needed base-devel rust gtk4 dbus xorg-server-xvfb
+sudo pacman -S --needed base-devel rust gtk4 dbus desktop-file-utils python \
+  xorg-server-xvfb namcap
 ```
 
 GTK 4.10 or newer is required. The Codex CLI must also be installed and signed in.
@@ -31,20 +32,49 @@ The executable is discovered from `PATH`, `~/.local/bin`, `~/.npm-global/bin`, o
 Build and run from this directory:
 
 ```sh
+make verify
 make test
 make visual-test
 make build
 ./target/release/codex-usage-bar
 ```
 
+`make verify` is the authoritative Linux check: formatting, Cargo check, Clippy with
+warnings denied, tests, installed/archive package smoke tests, reproducible source
+archives, metadata validation, and Xvfb visual checks. Package smoke tests require
+`desktop-file-validate`, Python 3, `b2sum`, and the normal Rust/GTK build tools.
+
 Create and install a native Arch package:
 
 ```sh
 make arch-package
-sudo pacman -U packaging/arch/codex-usage-bar-0.1.0-1-*.pkg.tar.zst
+sudo pacman -U packaging/arch/codex-usage-bar-*-*.pkg.tar.zst
 ```
 
-The included PKGBUILD consumes the source archive made from the current checkout, so it is usable before the project has tagged Linux releases.
+The PKGBUILD names the versioned GitHub release archive and pins its BLAKE2 checksum.
+`make arch-package` first creates that same deterministic archive in the current
+checkout and places it in makepkg's source cache, so local packaging remains usable
+before a tag is published and does not silently bypass checksum verification.
+
+To inspect the release inputs without building an Arch package:
+
+```sh
+make dist
+b2sum -c target/dist/codex-usage-bar-*.tar.gz.b2
+make dist-reproducible
+make package-test
+```
+
+The archive preserves the repository-relative `linux/` and `Fixtures/` layout,
+rebuilds byte-for-byte with a recorded `SOURCE_DATE_EPOCH`, and is rebuilt and tested
+from its extracted contents by `make package-test`. In source-archive mode the same
+target validates the archive checksum, desktop metadata, SVG, staged install, and
+executables while clearly skipping only the repository-owned PKGBUILD, which cannot
+be embedded in the archive it checksums. These targets only prepare and verify
+artifacts; they do not publish a release.
+The default archive epoch is the commit-independent value `0`; release automation
+may set `SOURCE_DATE_EPOCH` explicitly, and that chosen value is recorded inside the
+archive so an extracted tree can reproduce the same bytes.
 
 ## Gentoo and other source-based distributions
 
@@ -98,6 +128,8 @@ codex-usage-bar --background    # explicitly start hidden, as used by autostart
 codex-usage-bar --no-tray       # popover only; quit when dismissed
 codex-usage-bar --check         # test app-server access without GTK/display
 codex-usage-bar --waybar        # one JSON status update for Waybar
+codex-usage-bar --help          # print command help
+codex-usage-bar --version       # print the canonical package version
 ```
 
 Preferences are stored in `${XDG_CONFIG_HOME:-~/.config}/codex-usage-bar/config.json`. Enabling “Open at login” creates `${XDG_CONFIG_HOME:-~/.config}/autostart/io.github.conjfrnk.CodexUsageBar.desktop` using the installed executable's absolute path. If neither `XDG_CONFIG_HOME` nor `HOME` identifies an absolute directory, the app safely leaves persistence and autostart unavailable instead of reading or writing a working-directory-relative `.config`.
@@ -111,12 +143,20 @@ CODEX_USAGE_BAR_CODEX_PATH=/path/to/codex codex-usage-bar --check
 ## Development
 
 ```sh
+make verify
 make check
 make test
 cargo fmt --check
 ```
 
 `make check` treats Clippy warnings as errors. The tray service talks to the session D-Bus; the pure calculation and decoding tests do not require a graphical session.
+The repository-root `VERSION` file is authoritative; root `make check-version`
+rejects drift in Cargo, Cargo.lock, PKGBUILD, and bundle metadata. GitHub Actions runs
+the Rust 1.92 MSRV and stable toolchains, performs dependency license/source and
+RustSec advisory checks, and runs `makepkg` plus `namcap` in an Arch Linux container
+as an unprivileged package builder. CI uploads logs plus render artifacts only when
+verification fails. `make clean` and `make distclean` are explicit destructive
+maintenance targets and are never prerequisites of verification or CI.
 `make visual-test` mirrors the macOS visual-check workflow by rendering opaque light,
 dark, narrow, tall, live-size, every timeframe, loading, stale, error, maximum-token, and
 long-unbroken-diagnostic parity fixtures under

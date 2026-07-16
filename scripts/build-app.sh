@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${CONFIGURATION:-release}"
+/bin/bash "$ROOT_DIR/scripts/check-version.sh"
+APP_VERSION="$(< "$ROOT_DIR/VERSION")"
 APP_NAME="Codex Usage Bar"
 BUNDLE_ID="local.codex-usage-bar"
 OUTPUT_DIR="${APP_OUTPUT_DIR:-$ROOT_DIR/.build}"
@@ -21,6 +23,11 @@ case "$CONFIGURATION" in
         exit 64
         ;;
 esac
+
+if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'Invalid app version in %s/VERSION\n' "$ROOT_DIR" >&2
+    exit 1
+fi
 
 cd "$ROOT_DIR"
 swift build -c "$CONFIGURATION"
@@ -73,14 +80,15 @@ trap 'exit 143' TERM
 mkdir -p "$STAGING_APP/Contents/MacOS" "$STAGING_APP/Contents/Resources"
 cp "$EXECUTABLE_SOURCE" "$EXECUTABLE_DEST"
 cp "$ROOT_DIR/LICENSE" "$STAGING_APP/Contents/Resources/LICENSE"
+cp "$ROOT_DIR/VERSION" "$STAGING_APP/Contents/Resources/VERSION"
 swift "$ROOT_DIR/scripts/generate-app-icon.swift" "$STAGING_APP/Contents/Resources/$ICON_FILE"
 
 /usr/libexec/PlistBuddy -c "Clear dict" "$STAGING_APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$STAGING_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$STAGING_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$STAGING_APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$STAGING_APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.1.0" "$STAGING_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$STAGING_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$STAGING_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $APP_NAME" "$STAGING_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$STAGING_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string $ICON_NAME" "$STAGING_APP/Contents/Info.plist"

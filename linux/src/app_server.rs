@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::model::{AccountRateLimitsResponse, AccountTokenUsageResponse, UsageSnapshot};
+use crate::text_safety::is_unsafe_format_character;
 
 const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PENDING_MESSAGES: usize = 8;
@@ -329,6 +330,7 @@ fn exchange_messages(
         let (result, error) = response_payload(&message, id)?;
         if let Some(error) = error {
             if id == 3 {
+                rate_limits = Some(AccountRateLimitsResponse::failed_optional_request());
                 rate_limits_resolved = true;
                 continue;
             }
@@ -604,14 +606,21 @@ fn clean_stderr(stderr: &str) -> String {
 
 fn clean_diagnostic(value: &str) -> String {
     const MAXIMUM_CHARACTERS: usize = 237;
+    const MAXIMUM_REDACTION_INPUT_CHARACTERS: usize = 4096;
+    let bounded_input: String = value
+        .chars()
+        .take(MAXIMUM_REDACTION_INPUT_CHARACTERS)
+        .collect();
+    let canonical = canonicalize_for_redaction(&bounded_input);
+    let redacted = redact_credentials(&canonical);
     let mut clean = String::new();
     let mut character_count = 0;
     let mut pending_space = false;
     let mut was_truncated = false;
-    for character in value.chars() {
+    for character in redacted.chars() {
         if character.is_control()
             || character.is_whitespace()
-            || is_invisible_format_control(character)
+            || is_unsafe_format_character(character)
         {
             pending_space = character_count > 0;
             continue;
@@ -643,16 +652,360 @@ fn clean_diagnostic(value: &str) -> String {
     }
 }
 
-fn is_invisible_format_control(character: char) -> bool {
+fn canonicalize_for_redaction(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if is_unsafe_format_character(character) {
+                None
+            } else if character.is_control() {
+                character.is_whitespace().then_some(' ')
+            } else {
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+fn redact_credentials(value: &str) -> String {
+    let with_url_credentials_redacted = redact_url_userinfo(value);
+    let with_authorization_redacted = redact_authorization(&with_url_credentials_redacted);
+    let with_named_values_redacted = redact_named_secret_values(&with_authorization_redacted);
+    let partially_redacted = redact_standalone_token_shapes(&with_named_values_redacted);
+
+    // Diagnostics are capability hints, not logs. Once any credential marker
+    // is found, hide the complete bounded diagnostic. This conservative policy
+    // also covers unterminated quotes and a URL user-info delimiter whose `@`
+    // lies beyond the bounded inspection prefix.
+    if partially_redacted != value || contains_credential_indicator(value) {
+        "[REDACTED]".into()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn contains_credential_indicator(value: &str) -> bool {
+    contains_url_authority_colon(value) || contains_credential_assignment(value)
+}
+
+fn contains_url_authority_colon(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        if &bytes[index..index + 3] != b"://" {
+            index += 1;
+            continue;
+        }
+        let authority_start = index + 3;
+        let mut authority_end = authority_start;
+        while authority_end < bytes.len()
+            && !matches!(bytes[authority_end], b'/' | b'?' | b'#')
+            && !bytes[authority_end].is_ascii_whitespace()
+        {
+            authority_end += 1;
+        }
+        if bytes[authority_start..authority_end].contains(&b':') {
+            return true;
+        }
+        index = authority_end.max(index + 1);
+    }
+    false
+}
+
+fn contains_credential_assignment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'-'))
+        {
+            index += 1;
+        }
+        let normalized: String = bytes[start..index]
+            .iter()
+            .filter(|byte| !matches!(**byte, b'_' | b'-'))
+            .map(|byte| byte.to_ascii_lowercase() as char)
+            .collect();
+        let is_credential_key = matches!(
+            normalized.as_str(),
+            "authorization"
+                | "proxyauthorization"
+                | "openaiapikey"
+                | "xapikey"
+                | "apikey"
+                | "accesstoken"
+                | "refreshtoken"
+                | "authtoken"
+                | "clientsecret"
+                | "password"
+                | "passwd"
+                | "secret"
+                | "token"
+        );
+        if !is_credential_key {
+            continue;
+        }
+        let mut cursor = index;
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if cursor < bytes.len() && matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            skip_ascii_whitespace(bytes, &mut cursor);
+        }
+        if cursor < bytes.len() && matches!(bytes[cursor], b':' | b'=') {
+            return true;
+        }
+    }
+    false
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        if &bytes[index..index + 3] != b"://" {
+            index += 1;
+            continue;
+        }
+        let authority_start = index + 3;
+        let mut authority_end = authority_start;
+        while authority_end < bytes.len()
+            && !matches!(bytes[authority_end], b'/' | b'?' | b'#')
+            && !bytes[authority_end].is_ascii_whitespace()
+        {
+            authority_end += 1;
+        }
+        if let Some(at_offset) = bytes[authority_start..authority_end]
+            .iter()
+            .rposition(|byte| *byte == b'@')
+        {
+            let userinfo_end = authority_start + at_offset;
+            if bytes[authority_start..userinfo_end].contains(&b':') {
+                ranges.push((authority_start, userinfo_end));
+            }
+        }
+        index = authority_end.max(index + 1);
+    }
+    replace_byte_ranges(value, ranges)
+}
+
+fn redact_authorization(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut ranges = Vec::new();
+    let key = b"authorization";
+    let mut index = 0;
+    while index + key.len() <= bytes.len() {
+        if !ascii_key_matches(bytes, index, key) {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + key.len();
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if cursor < bytes.len() && matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            skip_ascii_whitespace(bytes, &mut cursor);
+        }
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b':' | b'=') {
+            index += 1;
+            continue;
+        }
+        cursor += 1;
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if cursor < bytes.len() && matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            skip_ascii_whitespace(bytes, &mut cursor);
+        }
+        let scheme_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+            cursor += 1;
+        }
+        let scheme = &bytes[scheme_start..cursor];
+        if !(scheme.eq_ignore_ascii_case(b"bearer") || scheme.eq_ignore_ascii_case(b"basic")) {
+            index += 1;
+            continue;
+        }
+        let before_credential = cursor;
+        skip_ascii_whitespace(bytes, &mut cursor);
+        if cursor == before_credential || cursor >= bytes.len() {
+            index += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b',' | b';' | b'\'' | b'"')
+        {
+            cursor += 1;
+        }
+        if cursor > start {
+            ranges.push((start, cursor));
+        }
+        index = cursor.max(index + 1);
+    }
+    replace_byte_ranges(value, ranges)
+}
+
+fn redact_named_secret_values(value: &str) -> String {
+    const KEYS: [&[u8]; 16] = [
+        b"openai_api_key",
+        b"openai-api-key",
+        b"x_api_key",
+        b"x-api-key",
+        b"api_key",
+        b"api-key",
+        b"access_token",
+        b"access-token",
+        b"refresh_token",
+        b"refresh-token",
+        b"auth_token",
+        b"auth-token",
+        b"client_secret",
+        b"client-secret",
+        b"password",
+        b"passwd",
+    ];
+    const SHORT_KEYS: [&[u8]; 2] = [b"secret", b"token"];
+
+    let bytes = value.as_bytes();
+    let mut ranges = Vec::new();
+    for key in KEYS.into_iter().chain(SHORT_KEYS) {
+        let mut index = 0;
+        while index + key.len() <= bytes.len() {
+            if !ascii_key_matches(bytes, index, key) {
+                index += 1;
+                continue;
+            }
+            let mut cursor = index + key.len();
+            skip_ascii_whitespace(bytes, &mut cursor);
+            if cursor < bytes.len() && matches!(bytes[cursor], b'\'' | b'"') {
+                cursor += 1;
+                skip_ascii_whitespace(bytes, &mut cursor);
+            }
+            if cursor >= bytes.len() || !matches!(bytes[cursor], b':' | b'=') {
+                index += 1;
+                continue;
+            }
+            cursor += 1;
+            skip_ascii_whitespace(bytes, &mut cursor);
+            if cursor >= bytes.len() {
+                index += 1;
+                continue;
+            }
+            let quote = matches!(bytes[cursor], b'\'' | b'"').then_some(bytes[cursor]);
+            if quote.is_some() {
+                cursor += 1;
+            }
+            let start = cursor;
+            while cursor < bytes.len()
+                && quote.map_or(
+                    !bytes[cursor].is_ascii_whitespace()
+                        && !matches!(bytes[cursor], b',' | b';' | b'&' | b'#'),
+                    |quote| bytes[cursor] != quote,
+                )
+            {
+                cursor += 1;
+            }
+            if cursor > start {
+                ranges.push((start, cursor));
+            }
+            index = cursor.max(index + 1);
+        }
+    }
+    replace_byte_ranges(value, ranges)
+}
+
+fn redact_standalone_token_shapes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_token_shape_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && is_token_shape_byte(bytes[index]) {
+            index += 1;
+        }
+        let token = &value[start..index];
+        let lower = token.to_ascii_lowercase();
+        let looks_like_known_token = (lower.starts_with("sk-") && token.len() >= 11)
+            || (["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+                && token.len() >= 12)
+            || (lower.starts_with("github_pat_") && token.len() >= 19)
+            || (["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+                && token.len() >= 13)
+            || (lower.starts_with("akia") && token.len() >= 20)
+            || looks_like_jwt(token);
+        if looks_like_known_token {
+            ranges.push((start, index));
+        }
+    }
+    replace_byte_ranges(value, ranges)
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    if !value.starts_with("eyJ") {
+        return false;
+    }
+    let mut segments = value.split('.');
     matches!(
-        character,
-        '\u{061c}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
+        (segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some(first), Some(second), Some(third), None)
+            if first.len() >= 7 && second.len() >= 4 && third.len() >= 4
     )
+}
+
+fn is_token_shape_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+fn ascii_key_matches(bytes: &[u8], index: usize, key: &[u8]) -> bool {
+    if index + key.len() > bytes.len() || !bytes[index..index + key.len()].eq_ignore_ascii_case(key)
+    {
+        return false;
+    }
+    let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    (index == 0 || !is_identifier_byte(bytes[index - 1]))
+        && (index + key.len() == bytes.len() || !is_identifier_byte(bytes[index + key.len()]))
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn replace_byte_ranges(value: &str, mut ranges: Vec<(usize, usize)>) -> String {
+    if ranges.is_empty() {
+        return value.to_owned();
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut redacted = value.to_owned();
+    for (start, end) in merged.into_iter().rev() {
+        debug_assert!(redacted.is_char_boundary(start) && redacted.is_char_boundary(end));
+        redacted.replace_range(start..end, "[REDACTED]");
+    }
+    redacted
 }
 
 fn resolve_codex() -> Option<PathBuf> {
@@ -847,7 +1200,12 @@ done
         );
         let snapshot = run_fake_codex(&script, Duration::from_secs(1)).unwrap();
         assert_eq!(snapshot.buckets()[0].tokens, 7);
-        assert!(snapshot.rate_limits.is_none());
+        let limits = snapshot.rate_limits.unwrap();
+        assert_eq!(
+            limits.decoding_issues,
+            ["response: optional request failed"]
+        );
+        assert!(!limits.has_meaningful_data());
     }
 
     #[test]
@@ -1094,6 +1452,105 @@ printf '%s\n' '{"id":1,"result":{}}'
         let error = AppServerError::from(source).to_string();
         assert!(!error.chars().any(char::is_control));
         assert!(!error.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn diagnostics_redact_synthetic_credentials() {
+        let diagnostic = concat!(
+            "Authorization: Bearer synthetic-bearer-credential ",
+            "OPENAI_API_KEY=sk-synthetic-api-key-value ",
+            "https://synthetic-user:synthetic-password@example.test/private?token=synthetic-query-token ",
+            "eyJsynthetic.headerpart.signaturepart"
+        );
+        let clean = clean_stderr(diagnostic);
+        assert!(clean.contains("[REDACTED]"));
+        for synthetic_secret in [
+            "synthetic-bearer-credential",
+            "sk-synthetic-api-key-value",
+            "synthetic-user",
+            "synthetic-password",
+            "synthetic-query-token",
+            "eyJsynthetic.headerpart.signaturepart",
+        ] {
+            assert!(!clean.contains(synthetic_secret), "{clean}");
+        }
+
+        let server = describe_server_error(&json!({
+            "message": "client_secret=synthetic-server-secret"
+        }));
+        assert!(server.contains("[REDACTED]"));
+        assert!(!server.contains("synthetic-server-secret"));
+
+        for (diagnostic, secret) in [
+            (
+                r#"{"Authorization":"Bearer synthetic-json-authorization"}"#,
+                "synthetic-json-authorization",
+            ),
+            (
+                r#"{"Proxy-Authorization":"Basic synthetic-proxy-authorization"}"#,
+                "synthetic-proxy-authorization",
+            ),
+            (
+                r#"{"api_key":"synthetic-json-api-key"}"#,
+                "synthetic-json-api-key",
+            ),
+            (
+                r#"{"openaiApiKey":"synthetic-camel-api-key"}"#,
+                "synthetic-camel-api-key",
+            ),
+            (
+                r#"{"accessToken":"synthetic-camel-access-token"}"#,
+                "synthetic-camel-access-token",
+            ),
+            (
+                "Authoriz\u{200b}ation: Bearer synthetic-format-authorization",
+                "synthetic-format-authorization",
+            ),
+            (
+                "Authoriz\u{00ad}ation: Bearer synthetic-soft-hyphen-secret",
+                "synthetic-soft-hyphen-secret",
+            ),
+            (
+                "Authoriz\u{0600}ation: Bearer synthetic-arabic-format-secret",
+                "synthetic-arabic-format-secret",
+            ),
+            (
+                "Authoriz\u{180e}ation: Bearer synthetic-mongolian-format-secret",
+                "synthetic-mongolian-format-secret",
+            ),
+            (
+                "Authoriz\u{fe0f}ation: Bearer synthetic-variation-secret",
+                "synthetic-variation-secret",
+            ),
+            (
+                "Authoriz\u{034f}ation: Bearer synthetic-grapheme-secret",
+                "synthetic-grapheme-secret",
+            ),
+            (
+                "Authoriz\u{fdd0}ation: Bearer synthetic-noncharacter-secret",
+                "synthetic-noncharacter-secret",
+            ),
+            (
+                "Authoriz\u{10ffff}ation: Bearer synthetic-plane-end-secret",
+                "synthetic-plane-end-secret",
+            ),
+            (
+                "to\u{202e}ken=synthetic-format-token",
+                "synthetic-format-token",
+            ),
+            (r#"api_key="top secret"#, "top secret"),
+            (r#"api_key="top\"secret"#, r#"top\"secret"#),
+        ] {
+            let clean = clean_diagnostic(diagnostic);
+            assert!(clean.contains("[REDACTED]"), "{clean}");
+            assert!(!clean.contains(secret), "{clean}");
+        }
+
+        let long_credential_url = format!(
+            "https://synthetic-user:{}@example.test/private",
+            "p".repeat(5_000)
+        );
+        assert_eq!(clean_diagnostic(&long_credential_url), "[REDACTED]");
     }
 
     #[test]
