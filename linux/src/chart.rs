@@ -335,8 +335,12 @@ fn draw_chart_with_foreground(
     timeframe: Timeframe,
     selected: Option<usize>,
     foreground: gdk::RGBA,
+    include_trend: bool,
 ) {
-    let prepared = PreparedChart::new(buckets);
+    let mut prepared = PreparedChart::new(buckets);
+    if !include_trend {
+        prepared.trend = None;
+    }
     draw_prepared_chart(
         context, width, height, buckets, &prepared, timeframe, selected, foreground, true, false,
     );
@@ -368,6 +372,9 @@ fn draw_prepared_chart(
 
     let has_activity = data_available && peak > 0;
     let accent = chart_accent(foreground, high_contrast);
+    if has_activity && let Some(trend) = prepared.trend {
+        draw_trend_line(context, layout, trend, axis_max, accent);
+    }
     if has_activity && buckets.len() > 1 {
         let maximum_points = (width.max(1) as usize)
             .saturating_mul(DRAW_POINTS_PER_PIXEL)
@@ -432,6 +439,34 @@ fn draw_prepared_chart(
             foreground,
         );
     }
+}
+
+fn draw_trend_line(
+    context: &cairo::Context,
+    layout: ChartLayout,
+    trend: [ChartSample; 2],
+    axis_max: i64,
+    accent: (f64, f64, f64),
+) {
+    if context.save().is_err() {
+        return;
+    }
+    context.rectangle(layout.left, layout.top, layout.width(), layout.height());
+    context.clip();
+    context.set_source_rgba(accent.0, accent.1, accent.2, 0.28);
+    context.set_line_width(1.5);
+    context.set_line_cap(cairo::LineCap::Round);
+    for (index, sample) in trend.iter().enumerate() {
+        let x = layout.left + sample.position * layout.width();
+        let y = unclamped_y_position(sample.value, layout, axis_max);
+        if index == 0 {
+            context.move_to(x, y);
+        } else {
+            context.line_to(x, y);
+        }
+    }
+    let _ = context.stroke();
+    let _ = context.restore();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -627,6 +662,10 @@ fn y_position(value: f64, layout: ChartLayout, axis_max: i64) -> f64 {
     layout.bottom - layout.height() * ratio
 }
 
+fn unclamped_y_position(value: f64, layout: ChartLayout, axis_max: i64) -> f64 {
+    layout.bottom - layout.height() * value / axis_max.max(1) as f64
+}
+
 fn set_rgba(context: &cairo::Context, color: gdk::RGBA, alpha: f64) {
     context.set_source_rgba(
         f64::from(color.red()),
@@ -781,6 +820,16 @@ mod tests {
         selected: Option<usize>,
         dark: bool,
     ) -> Vec<u8> {
+        render_fixture_with_trend(buckets, timeframe, selected, dark, true)
+    }
+
+    fn render_fixture_with_trend(
+        buckets: &[DailyUsageBucket],
+        timeframe: Timeframe,
+        selected: Option<usize>,
+        dark: bool,
+        include_trend: bool,
+    ) -> Vec<u8> {
         let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 264, 150).unwrap();
         let context = cairo::Context::new(&surface).unwrap();
         if dark {
@@ -794,11 +843,33 @@ mod tests {
         } else {
             gdk::RGBA::new(0.12, 0.12, 0.13, 1.0)
         };
-        draw_chart_with_foreground(&context, 264, 150, buckets, timeframe, selected, foreground);
+        draw_chart_with_foreground(
+            &context,
+            264,
+            150,
+            buckets,
+            timeframe,
+            selected,
+            foreground,
+            include_trend,
+        );
         context.status().unwrap();
         drop(context);
         surface.flush();
         surface.data().unwrap().to_vec()
+    }
+
+    fn assert_trend(values: &[i64], positions: &[f64], expected: [f64; 2]) {
+        let trend = least_squares_trend(values, positions).expect("expected a visible trend");
+        assert_eq!(trend[0].position, 0.0);
+        assert_eq!(trend[1].position, 1.0);
+        for (sample, expected_value) in trend.iter().zip(expected) {
+            assert!(
+                (sample.value - expected_value).abs() <= 1e-9,
+                "expected {expected_value}, got {}",
+                sample.value
+            );
+        }
     }
 
     #[test]
@@ -810,6 +881,88 @@ mod tests {
         ];
         assert_eq!(bucket_positions(&buckets), vec![0.0, 0.1, 1.0]);
         assert_eq!(nearest_index(0.2, &bucket_positions(&buckets)), Some(1));
+    }
+
+    #[test]
+    fn trend_direction_and_magnitude_use_every_visible_value() {
+        let positions = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+        assert_trend(&[10, 0, 0, 10, 10], &positions, [4.0, 8.0]);
+        assert_trend(&[10, 10, 0, 0, 10], &positions, [8.0, 4.0]);
+        assert_trend(&[10, 0, 0, 20, 20], &positions, [2.0, 18.0]);
+    }
+
+    #[test]
+    fn trend_uses_calendar_positions_and_preserves_a_positive_flat_average() {
+        assert_trend(&[10, 20, 60], &[0.0, 0.2, 1.0], [10.0, 60.0]);
+        assert_trend(&[42, 42, 42], &[0.0, 0.5, 1.0], [42.0, 42.0]);
+    }
+
+    #[test]
+    fn trend_is_absent_for_insufficient_or_zero_activity_series() {
+        assert_eq!(least_squares_trend(&[], &[]), None);
+        assert_eq!(least_squares_trend(&[42], &[0.5]), None);
+        assert_eq!(least_squares_trend(&[0, 0], &[0.0, 1.0]), None);
+        assert_eq!(least_squares_trend(&[1, 2], &[0.0]), None);
+    }
+
+    #[test]
+    fn eligible_trend_is_rendered_and_clipped_to_the_plot() {
+        let buckets = daily_buckets(5, |day| if day == 4 { 100 } else { 0 });
+        let with_trend = render_fixture_with_trend(
+            &buckets,
+            Timeframe::Seven,
+            None,
+            false,
+            true,
+        );
+        let without_trend = render_fixture_with_trend(
+            &buckets,
+            Timeframe::Seven,
+            None,
+            false,
+            false,
+        );
+        let layout = ChartLayout::new(264.0, 150.0);
+        let differing_pixels: Vec<_> = with_trend
+            .chunks_exact(4)
+            .zip(without_trend.chunks_exact(4))
+            .enumerate()
+            .filter_map(|(index, (with, without))| (with != without).then_some(index))
+            .collect();
+
+        assert!(!differing_pixels.is_empty());
+        assert!(differing_pixels.iter().all(|index| {
+            let x = (*index % 264) as f64;
+            let y = (*index / 264) as f64;
+            x >= layout.left.floor()
+                && x <= layout.right.ceil()
+                && y >= layout.top.floor()
+                && y <= layout.bottom.ceil()
+        }));
+
+        let zero_activity = daily_buckets(5, |_| 0);
+        assert_eq!(
+            render_fixture_with_trend(
+                &zero_activity,
+                Timeframe::Seven,
+                None,
+                false,
+                true,
+            ),
+            render_fixture_with_trend(
+                &zero_activity,
+                Timeframe::Seven,
+                None,
+                false,
+                false,
+            )
+        );
+        let single = [bucket("2026-04-11", 42)];
+        assert_eq!(
+            render_fixture_with_trend(&single, Timeframe::All, None, false, true),
+            render_fixture_with_trend(&single, Timeframe::All, None, false, false)
+        );
     }
 
     #[test]

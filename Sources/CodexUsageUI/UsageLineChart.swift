@@ -172,6 +172,7 @@ public struct UsageLineChart: View {
 
             ZStack(alignment: .topLeading) {
                 axes(in: layout)
+                trendLine(in: layout)
                 usageLine(in: layout)
 
                 if buckets.isEmpty || !hasActivity {
@@ -280,6 +281,41 @@ public struct UsageLineChart: View {
                     x: xAxisLabelCenter(for: index, x: x, in: layout),
                     y: layout.plotRect.maxY + 13
                 )
+        }
+    }
+
+    @ViewBuilder
+    private func trendLine(in layout: ChartLayout) -> some View {
+        if hasActivity && buckets.count > 1 {
+            let samples = UsageChartMath.linearTrendSamples(
+                values: buckets.map(\.tokens),
+                positions: positions
+            )
+            Canvas { context, _ in
+                var clipPath = Path()
+                clipPath.addRect(layout.plotRect)
+                context.clip(to: clipPath)
+
+                var path = Path()
+                for (index, sample) in samples.enumerated() {
+                    let point = CGPoint(
+                        x: layout.plotRect.minX
+                            + (CGFloat(sample.position) * layout.plotRect.width),
+                        y: unclampedYPosition(for: sample.value, in: layout)
+                    )
+                    if index == 0 {
+                        path.move(to: point)
+                    } else {
+                        path.addLine(to: point)
+                    }
+                }
+                context.stroke(
+                    path,
+                    with: .color(accentColor.opacity(0.22)),
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                )
+            }
+            .allowsHitTesting(false)
         }
     }
 
@@ -548,6 +584,11 @@ public struct UsageLineChart: View {
 
     private func yPosition(for value: Double, in layout: ChartLayout) -> CGFloat {
         let ratio = min(max(value / Double(max(yAxisMax, 1)), 0), 1)
+        return layout.plotRect.maxY - (layout.plotRect.height * CGFloat(ratio))
+    }
+
+    private func unclampedYPosition(for value: Double, in layout: ChartLayout) -> CGFloat {
+        let ratio = value / Double(max(yAxisMax, 1))
         return layout.plotRect.maxY - (layout.plotRect.height * CGFloat(ratio))
     }
 

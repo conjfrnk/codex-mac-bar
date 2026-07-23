@@ -220,6 +220,67 @@ public enum UsageChartMath {
         )
     }
 
+    /// Returns the endpoints of the ordinary least-squares line through the
+    /// complete series. Centering both axes keeps the fit stable for large token
+    /// counts, while the chart's real calendar positions ensure uneven dates
+    /// contribute at their actual horizontal coordinates.
+    public static func linearTrendSamples(
+        values: [Int64],
+        positions: [Double]
+    ) -> [UsageChartSample] {
+        guard values.count > 1 else { return [] }
+        let useSuppliedPositions = validPositions(positions, count: values.count)
+        func position(at index: Int) -> Double {
+            useSuppliedPositions
+                ? positions[index]
+                : evenlySpacedPosition(index: index, count: values.count)
+        }
+
+        var meanPosition = 0.0
+        var meanValue = 0.0
+        for index in values.indices {
+            let count = Double(index + 1)
+            meanPosition += (position(at: index) - meanPosition) / count
+            meanValue += (Double(values[index]) - meanValue) / count
+        }
+
+        var positionVariance = 0.0
+        var positionVarianceCorrection = 0.0
+        var covariance = 0.0
+        var covarianceCorrection = 0.0
+        for index in values.indices {
+            let centeredPosition = position(at: index) - meanPosition
+            let centeredValue = Double(values[index]) - meanValue
+
+            let varianceTerm = (centeredPosition * centeredPosition)
+                - positionVarianceCorrection
+            let nextVariance = positionVariance + varianceTerm
+            positionVarianceCorrection = (nextVariance - positionVariance) - varianceTerm
+            positionVariance = nextVariance
+
+            let covarianceTerm = (centeredPosition * centeredValue)
+                - covarianceCorrection
+            let nextCovariance = covariance + covarianceTerm
+            covarianceCorrection = (nextCovariance - covariance) - covarianceTerm
+            covariance = nextCovariance
+        }
+
+        guard positionVariance.isFinite,
+              positionVariance > 0,
+              covariance.isFinite
+        else { return [] }
+        let slope = covariance / positionVariance
+        let firstPosition = position(at: values.startIndex)
+        let lastPosition = position(at: values.index(before: values.endIndex))
+        let firstValue = meanValue + (slope * (firstPosition - meanPosition))
+        let lastValue = meanValue + (slope * (lastPosition - meanPosition))
+        guard firstValue.isFinite, lastValue.isFinite else { return [] }
+        return [
+            UsageChartSample(position: firstPosition, value: firstValue),
+            UsageChartSample(position: lastPosition, value: lastValue)
+        ]
+    }
+
     public static func tickIndices(pointCount: Int, maximumTickCount: Int) -> [Int] {
         guard pointCount > 0, maximumTickCount > 0 else { return [] }
         guard pointCount > 1, maximumTickCount > 1 else { return [0] }

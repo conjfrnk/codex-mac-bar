@@ -492,6 +492,77 @@ struct DataAndChartTests {
     }
 
     @Test
+    func testLinearTrendUsesEveryValueForDirectionAndMagnitude() {
+        let positions = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+        #expect(
+            UsageChartMath.linearTrendSamples(
+                values: [10, 0, 0, 10, 10],
+                positions: positions
+            ) == [
+                UsageChartSample(position: 0, value: 4),
+                UsageChartSample(position: 1, value: 8)
+            ]
+        )
+        #expect(
+            UsageChartMath.linearTrendSamples(
+                values: [10, 10, 0, 0, 10],
+                positions: positions
+            ) == [
+                UsageChartSample(position: 0, value: 8),
+                UsageChartSample(position: 1, value: 4)
+            ]
+        )
+        #expect(
+            UsageChartMath.linearTrendSamples(
+                values: [10, 0, 0, 20, 20],
+                positions: positions
+            ) == [
+                UsageChartSample(position: 0, value: 2),
+                UsageChartSample(position: 1, value: 18)
+            ]
+        )
+    }
+
+    @Test
+    func testLinearTrendUsesCalendarPositionsAndHandlesFlatOrInsufficientSeries() {
+        let calendarTrend = UsageChartMath.linearTrendSamples(
+            values: [10, 20, 60],
+            positions: [0, 0.2, 1]
+        )
+        #expect(calendarTrend.map(\.position) == [0, 1])
+        #expect(abs((calendarTrend.first?.value ?? .nan) - 10) <= 0.000_001)
+        #expect(abs((calendarTrend.last?.value ?? .nan) - 60) <= 0.000_001)
+        #expect(
+            UsageChartMath.linearTrendSamples(
+                values: [42, 42, 42],
+                positions: [0, 0.5, 1]
+            ) == [
+                UsageChartSample(position: 0, value: 42),
+                UsageChartSample(position: 1, value: 42)
+            ]
+        )
+        #expect(
+            UsageChartMath.linearTrendSamples(
+                values: [10, 20, 30],
+                positions: [0, .nan, 1]
+            ) == [
+                UsageChartSample(position: 0, value: 10),
+                UsageChartSample(position: 1, value: 30)
+            ]
+        )
+        let extreme = UsageChartMath.linearTrendSamples(
+            values: [0, .max, 0],
+            positions: [0, 0.5, 1]
+        )
+        #expect(extreme.count == 2)
+        #expect(extreme.allSatisfy { $0.position.isFinite && $0.value.isFinite })
+        #expect(extreme.first?.value == extreme.last?.value)
+        #expect(UsageChartMath.linearTrendSamples(values: [], positions: []).isEmpty)
+        #expect(UsageChartMath.linearTrendSamples(values: [42], positions: [0.5]).isEmpty)
+    }
+
+    @Test
     func testLargeTickSelectionDoesNotRevalidateForEveryTick() {
         let pointCount = 100_000
         let positions = (0..<pointCount).map { Double($0) / Double(pointCount - 1) }

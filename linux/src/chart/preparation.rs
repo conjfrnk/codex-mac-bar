@@ -57,6 +57,7 @@ pub(super) struct PreparedChart {
     pub(super) peak: i64,
     pub(super) plot_values: Vec<i64>,
     pub(super) plot_positions: Vec<f64>,
+    pub(super) trend: Option<[ChartSample; 2]>,
 }
 
 impl PreparedChart {
@@ -64,6 +65,7 @@ impl PreparedChart {
         let positions = bucket_positions(buckets);
         let values: Vec<_> = buckets.iter().map(chart_token_value).collect();
         let peak = values.iter().copied().max().unwrap_or(0);
+        let trend = least_squares_trend(&values, &positions);
         let (plot_values, plot_positions) =
             bounded_plot_series(&values, &positions, MAXIMUM_DRAW_POINTS);
         Self {
@@ -71,8 +73,55 @@ impl PreparedChart {
             peak,
             plot_values,
             plot_positions,
+            trend,
         }
     }
+}
+
+pub(super) fn least_squares_trend(
+    values: &[i64],
+    positions: &[f64],
+) -> Option<[ChartSample; 2]> {
+    if values.len() < 2
+        || !values.iter().any(|value| *value > 0)
+        || !valid_positions(positions, values.len())
+    {
+        return None;
+    }
+
+    let count = values.len() as f64;
+    let mean_position = positions.iter().sum::<f64>() / count;
+    let mean_value = values.iter().map(|value| *value as f64).sum::<f64>() / count;
+    let (covariance, position_variance) = positions.iter().zip(values).fold(
+        (0.0, 0.0),
+        |(covariance, position_variance), (position, value)| {
+            let centered_position = *position - mean_position;
+            (
+                covariance + centered_position * (*value as f64 - mean_value),
+                position_variance + centered_position * centered_position,
+            )
+        },
+    );
+    if !position_variance.is_finite() || position_variance <= f64::EPSILON {
+        return None;
+    }
+
+    let slope = covariance / position_variance;
+    let intercept = mean_value - slope * mean_position;
+    let end_value = intercept + slope;
+    if !intercept.is_finite() || !end_value.is_finite() {
+        return None;
+    }
+    Some([
+        ChartSample {
+            position: 0.0,
+            value: intercept,
+        },
+        ChartSample {
+            position: 1.0,
+            value: end_value,
+        },
+    ])
 }
 
 pub(super) fn chart_token_value(bucket: &DailyUsageBucket) -> i64 {
